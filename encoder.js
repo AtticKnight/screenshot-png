@@ -228,6 +228,92 @@ function chooseStrips(streams, w, h, channels, stripHeight, history, level) {
   return selected;
 }
 
+
+// Estimate each row with the same 32 KiB history of already selected rows.
+// Matches at another horizontal offset count as well as matches directly above.
+// The short hash chains bound work on repeated text and large flat fills.
+function chooseRowsByMatches(streams, stride, height) {
+  const selected = Buffer.allocUnsafe(stride * height);
+  const heads = new Int32Array(65536).fill(-1);
+  const previous = new Int32Array(32768);
+  const local = new Int32Array(65536);
+  const stamps = new Int32Array(65536);
+  const distanceCost = new Uint8Array(32769);
+  for (let d = 1; d < distanceCost.length; d++)
+    distanceCost[d] = 5 + Math.max(0, Math.floor(Math.log2(d)) - 1);
+  const lengthCost = new Uint8Array(259);
+  for (let n = 3; n < lengthCost.length; n++)
+    lengthCost[n] = 6 + Math.max(0, Math.floor(Math.log2(n - 2)) - 2);
+  const literalCost = Uint8Array.from(magnitude, (size, symbol) =>
+    symbol === 0 ? 2 : Math.min(11, 4 + Math.ceil(Math.log2(size + 1))));
+
+  function hash(at) {
+    return ((selected[at] * 251 + selected[at + 1]) * 251 + selected[at + 2]) & 65535;
+  }
+  function matchLength(at, from, limit) {
+    let n = 0;
+    while (n < limit && selected[at + n] === selected[from + n]) n++;
+    return n;
+  }
+
+  let stamp = 0;
+  for (let y = 0; y < height; y++) {
+    const start = y * stride, end = start + stride;
+    let bestFilter = 0, bestCost = Infinity;
+    for (let filter = 0; filter < 5; filter++) {
+      streams[filter].copy(selected, start, start, end);
+      stamp++;
+      let bits = 0;
+      for (let pos = start; pos < end;) {
+        if (pos + 2 >= end) {
+          bits += literalCost[selected[pos++]];
+          continue;
+        }
+        const bucket = hash(pos);
+        const limit = Math.min(258, end - pos);
+        let bestLength = 2, bestDistance = 0;
+        if (stamps[bucket] === stamp && pos - local[bucket] <= 32768) {
+          const from = local[bucket];
+          const length = matchLength(pos, from, limit);
+          if (length > bestLength) {
+            bestLength = length;
+            bestDistance = pos - from;
+          }
+        }
+        let from = heads[bucket];
+        for (let probe = 0; probe < 4 && from >= 0 && pos - from <= 32768 && bestLength < limit; probe++) {
+          if (selected[pos + bestLength] === selected[from + bestLength]) {
+            const length = matchLength(pos, from, limit);
+            if (length > bestLength) {
+              bestLength = length;
+              bestDistance = pos - from;
+            }
+          }
+          from = previous[from & 32767];
+        }
+        const useMatch = bestLength >= 4 || (bestLength === 3 && bestDistance <= 128);
+        const next = pos + (useMatch ? bestLength : 1);
+        bits += useMatch ? lengthCost[bestLength] + distanceCost[bestDistance] : literalCost[selected[pos]];
+        const sampleStep = next - pos >= 12 ? 3 : 1;
+        for (let p = pos; p < next && p + 2 < end; p += sampleStep) {
+          const key = hash(p);
+          local[key] = p;
+          stamps[key] = stamp;
+        }
+        pos = next;
+      }
+      if (bits < bestCost) { bestCost = bits; bestFilter = filter; }
+    }
+    streams[bestFilter].copy(selected, start, start, end);
+    for (let p = Math.max(0, start - 2); p + 2 < end; p++) {
+      const key = hash(p);
+      previous[p & 32767] = heads[key];
+      heads[key] = p;
+    }
+  }
+  return selected;
+}
+
 export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
@@ -267,6 +353,7 @@ export function encodeScreenshot(file) {
   const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
   const narrow = chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3);
   const layouts = [strongest.raw, wide, narrow];
+  if (image.mode !== 3) layouts.push(chooseRowsByMatches(alternatives, width * image.channels + 1, height));
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
   let bestRaw = distinct[0], bestSize = Infinity;
   for (const raw of distinct) {

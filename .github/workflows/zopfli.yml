@@ -31,6 +31,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends emscripten clang-18 lld-18
+          curl --fail --silent --show-error --location 'https://raw.githubusercontent.com/AtticKnight/screenshot-png/d2b3f38d4568d73356717be224aba9d9e5629f27/vendor/zopfli.cjs' -o /tmp/screenshot-zopfli-baseline.cjs
+          echo '2205cc3f6ab5a60c0d0e98e080d77989da169d4f75a2d397cacabc0415c1f60e  /tmp/screenshot-zopfli-baseline.cjs' | sha256sum -c -
           sh build/native-lib.sh libdeflate-source
           sh build/zopfli.sh zopfli-source
           wc -c vendor/zopfli.cjs vendor/libdeflate.wasm
@@ -44,6 +46,8 @@ jobs:
           assert.deepEqual(inflateSync(encoded),raw);
           console.log('Verified Zopfli zlib stream',raw.length,encoded.length);
           JS
+      - name: Compare both optimal parsers at equal iterations
+        run: node check/zopfli-equivalence.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: zopfli-javascript

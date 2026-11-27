@@ -2,7 +2,6 @@ import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
 
 import { compressOptimally } from './optimal.js';
 import { compressWithZopfli } from './zopfli.js';
-import { adjacencyOrders } from './palette-order.js';
 
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -242,22 +241,12 @@ export function encodeScreenshot(file) {
   if (gray) compare(directImage(pixels, opaque ? 0 : 4), 4);
   if (indexed) {
     const colors = Array.from(counts.keys());
-    const first = paletteImage(pixels, colors);
-    compare(first);
+    compare(paletteImage(pixels, colors));
     const luma = c => (c & 255) * 3 + ((c >>> 8) & 255) * 6 + ((c >>> 16) & 255);
     const sorted = colors.slice().sort((a, b) => luma(a) - luma(b) || a - b);
     if (sorted.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, sorted));
     const frequent = colors.slice().sort((a, b) => counts.get(b) - counts.get(a) || a - b);
     if (frequent.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, frequent));
-    if (!gray) {
-      const tried = new Set([colors,sorted,frequent].map(order => order.join(',')));
-      for (const order of adjacencyOrders(first.data,width,colors,counts)) {
-        const key = order.join(',');
-        if (tried.has(key)) continue;
-        tried.add(key);
-        compare(paletteImage(pixels,order),2);
-      }
-    }
   }
   if (!gray) compare(directImage(pixels, opaque ? 2 : 6), 4);
   let result = strongest.png;
@@ -282,6 +271,6 @@ export function encodeScreenshot(file) {
   // The entropy-model pass spends most of its time parsing the remaining tokens.
   // On large residual streams use the already measured near-optimal parse.
   // This fixed input-derived budget applies identically across all screenshots.
-  if (bestSize <= 128 * 1024) refine(bestRaw, image, compressWithZopfli);
+  if (bestSize <= 128 * 1024) refine(bestRaw, image, raw => compressWithZopfli(raw, bestSize < 49152 ? 5 : 3));
   return result;
 }

@@ -137,8 +137,10 @@ function filteredImages(image, width, height) {
   const { data, channels } = image;
   const stride = width * channels;
   const outputStride = stride + 1;
-  const streams = Array.from({ length: 7 }, () => Buffer.allocUnsafe(outputStride * height));
-  const [plain, sub, up, avg, paethStream, byMagnitude, byRuns] = streams;
+  const streams = Array.from({ length: 8 }, () => Buffer.allocUnsafe(outputStride * height));
+  const [plain, sub, up, avg, paethStream, byMagnitude, byRuns, byPairs] = streams;
+  const seenPair = new Uint32Array(65536);
+  const pairCounts = new Uint32Array(5);
   const sums = new Float64Array(5);
   const runs = new Float64Array(5);
   for (let y = 0; y < height; y++) {
@@ -170,16 +172,27 @@ function filteredImages(image, width, height) {
           last = b;
         }
       }
+      // Count distinct adjacent byte pairs. A tag avoids clearing 64 Ki entries
+      // per filter. Alternating sample positions retain both byte alignments.
+      const epoch = y * 5 + f + 1;
+      let pairs = 0;
+      for (let x = 1 + (y & 1); x < stride; x += 2) {
+        const pair = (stream[dst + x] << 8) | stream[dst + x + 1];
+        if (seenPair[pair] !== epoch) { seenPair[pair] = epoch; pairs++; }
+      }
+      pairCounts[f] = pairs;
       sums[f] = magnitudeTotal;
       runs[f] = symbolTotal;
     }
-    let a = 0, b = 0;
+    let a = 0, b = 0, c = 0;
     for (let f = 1; f < 5; f++) {
       if (sums[f] < sums[a]) a = f;
       if (runs[f] < runs[b]) b = f;
+      if (pairCounts[f] < pairCounts[c] || (pairCounts[f] === pairCounts[c] && sums[f] < sums[c])) c = f;
     }
     streams[a].copy(byMagnitude, dst, dst, dst + outputStride);
     streams[b].copy(byRuns, dst, dst, dst + outputStride);
+    streams[c].copy(byPairs, dst, dst, dst + outputStride);
   }
   return streams;
 }
@@ -261,7 +274,10 @@ export function encodeScreenshot(file) {
   const alternatives = chosenStreams;
   const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
   const narrow = chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3);
-  const layouts = [strongest.raw, wide, narrow];
+  // A whole scanline can cross a window boundary. Compare the five legal
+  // transforms against the previous 32 KiB of the already selected stream.
+  const rows = chooseStrips(alternatives.slice(0, 5), width, height, image.channels, 1, 32768, 3);
+  const layouts = [strongest.raw, wide, narrow, rows];
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
   let bestRaw = distinct[0], bestSize = Infinity;
   for (const raw of distinct) {

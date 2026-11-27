@@ -1,5 +1,6 @@
 import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
 
+import { chooseLzRows } from './row-filter.js';
 import { compressOptimally } from './optimal.js';
 import { compressWithZopfli } from './zopfli.js';
 
@@ -274,9 +275,7 @@ export function encodeScreenshot(file) {
   const alternatives = chosenStreams;
   const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
   const narrow = chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3);
-  // A whole scanline can cross a window boundary. Compare the five legal
-  // transforms against the previous 32 KiB of the already selected stream.
-  const rows = chooseStrips(alternatives.slice(0, 5), width, height, image.channels, 1, 32768, 3);
+  const rows = chooseLzRows(alternatives.slice(0, 5), width * image.channels + 1, height);
   const layouts = [strongest.raw, wide, narrow, rows];
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
   let bestRaw = distinct[0], bestSize = Infinity;

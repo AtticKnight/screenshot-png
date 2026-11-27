@@ -1,7 +1,7 @@
 name: Verify screenshot compression
 on:
   push:
-    branches: [bench-png-retain-optimized-scanlines]
+    branches: [bench-png-dense-region-codebooks]
 permissions:
   contents: read
 jobs:

@@ -187,6 +187,7 @@ function chooseCodebook(raw, start, end, lengthPath, distancePath, block) {
   for (let i = 0; i < distCounts.length; i++) {
     if (distCounts[i]) current += distCounts[i] * (block.distance.lens[i] || Infinity);
   }
+  if (Math.min(total, current) >= block.dataEnd - block.header) return { original: true };
   if (total < current)
     return { header, literal: prefixTree(lit, false), distance: prefixTree(dist, false) };
   return null;
@@ -714,6 +715,10 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
     if (costs[start] >= high) throw Error('Lost the input parse.');
 
     const improved = chooseCodebook(raw, start, end, lengthPath, distancePath, block);
+    if (improved?.original) {
+      writer.copy(reader, block.header, block.dataEnd);
+      continue;
+    }
     if (improved) writer.copy(new BitReader(improved.header.bytes), 0, improved.header.at);
     else writer.copy(reader, block.header, block.dataStart);
     const literalOut = improved?.literal || literal,
@@ -943,22 +948,48 @@ function writeSegments(tokens, layout, base) {
     base.subarray(-4),
   ]);
 }
+// Combine cuts proposed by different entropy penalties. A block may span a cut
+// that one estimate preferred, or end at a cut borrowed from another estimate.
+function combineLayouts(tokens, layouts, memo) {
+  const cuts = new Set([0, tokens.size, ...tokens.blockMarks]);
+  const predecessors = new Map();
+  function offer(start, end) {
+    if (!predecessors.has(end)) predecessors.set(end, new Set());
+    predecessors.get(end).add(start);
+  }
+  for (const layout of layouts) {
+    for (const [a, b] of layout) {
+      cuts.add(a); cuts.add(b); offer(a, b);
+    }
+  }
+  const original = [0, ...tokens.blockMarks, tokens.size].filter((v, i, all) => i === 0 || v !== all[i - 1]);
+  for (let i = 1; i < original.length; i++) offer(original[i - 1], original[i]);
+  const points = [...cuts].sort((a, b) => a - b);
+  const costs = new Map([[0, 0]]), parent = new Map();
+  for (let j = 1; j < points.length; j++) {
+    const end = points[j];
+    for (let i = Math.max(0, j - 4); i < j; i++) offer(points[i], end);
+    let best = Infinity;
+    for (const start of predecessors.get(end)) {
+      const block = segmentPlan(tokens, start, end, memo);
+      const price = costs.get(start) + block.bits;
+      if (price < best) { best = price; parent.set(end, block); }
+    }
+    costs.set(end, best);
+  }
+  const result = [];
+  for (let end = tokens.size; end > 0;) {
+    const block = parent.get(end); result.push(block); end = block.start;
+  }
+  return result.reverse();
+}
 // Rebuild block headers only when the new boundaries reduce the byte count.
 function repartition(raw, base, grain = 320) {
   const tokens = tokenize(raw, base);
   if (tokens.size < 5) return base;
   const memo = new Map();
-  let best = null,
-    target = Infinity;
   const layouts = recommendCuts(tokens, grain);
-  for (const ranges of layouts) {
-    const route = ranges.map(([a, b]) => segmentPlan(tokens, a, b, memo));
-    const bits = route.reduce((s, r) => s + r.bits, 0);
-    if (bits < target) {
-      best = route;
-      target = bits;
-    }
-  }
+  const best = combineLayouts(tokens, layouts, memo);
   // Improve estimated cuts using exact prefix-code and header costs at nearby token boundaries.
   for (let idx = 1; idx < best.length; idx++) {
     const a = best[idx - 1],
@@ -988,6 +1019,22 @@ function repartition(raw, base, grain = 320) {
     }
     best[idx - 1] = pa;
     best[idx] = pb;
+  }
+  // The same cut can move again when its neighbors have changed. Finish with
+  // narrower offsets to find shifts smaller than a coarse histogram chunk.
+  for (let j = best.length - 1; j > 0; j--) {
+    const a = best[j - 1], b = best[j];
+    let score = a.bits + b.bits;
+    const step = Math.max(1, Math.floor(grain / 14));
+    for (const off of [-2 * step, -step, step, 2 * step]) {
+      const at = a.end + off;
+      if (at <= a.start || at >= b.end) continue;
+      const left = segmentPlan(tokens, a.start, at, memo);
+      const right = segmentPlan(tokens, at, b.end, memo);
+      if (left.bits + right.bits < score) {
+        score = left.bits + right.bits; best[j - 1] = left; best[j] = right;
+      }
+    }
   }
   const out = writeSegments(tokens, best, base);
   return out.length < base.length ? out : base;

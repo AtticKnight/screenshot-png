@@ -40,7 +40,7 @@ function optimalLengths(freq, limit) {
   return result;
 }
 // Serialize the literal and distance code lengths with RFC 1951's repeat codes.
-function encodeCodebook(lit, dist, final) {
+function encodeCodebook(lit, dist, final, optimizeRuns = false) {
   let nl = lit.length,
     distanceCount = dist.length;
   while (nl > 257 && !lit[nl - 1]) nl--;
@@ -78,25 +78,84 @@ function encodeCodebook(lit, dist, final) {
     while (count-- > 0) add(a);
     i = j;
   }
-  const frequencies = new Uint32Array(19);
-  for (const g of groups) frequencies[g.s]++;
-  const tree = prefixTree(optimalLengths(frequencies, 7), false);
-  let nc = 19;
-  while (nc > 4 && !tree.lens[codeLengthOrder[nc - 1]]) nc--;
-  const w = new BitWriter(256);
-  w.write(final, 1);
-  w.write(2, 2);
-  w.write(nl - 257, 5);
-  w.write(distanceCount - 1, 5);
-  w.write(nc - 4, 4);
-  for (let i = 0; i < nc; i++) w.write(tree.lens[codeLengthOrder[i]], 3);
-  for (const g of groups) {
-    printSymbol(w, tree, g.s);
-    w.write(g.v, g.b);
+  function write(tokens) {
+    const frequencies = new Uint32Array(19);
+    for (const token of tokens) frequencies[token.s]++;
+    const tree = prefixTree(optimalLengths(frequencies, 7), false);
+    let count = 19;
+    while (count > 4 && !tree.lens[codeLengthOrder[count - 1]]) count--;
+    const writer = new BitWriter(256);
+    writer.write(final, 1);
+    writer.write(2, 2);
+    writer.write(nl - 257, 5);
+    writer.write(distanceCount - 1, 5);
+    writer.write(count - 4, 4);
+    for (let i = 0; i < count; i++) writer.write(tree.lens[codeLengthOrder[i]], 3);
+    for (const token of tokens) {
+      printSymbol(writer, tree, token.s);
+      writer.write(token.v, token.b);
+    }
+    return { writer, prices: tree.lens };
   }
-  return w;
+  let best = write(groups).writer;
+  if (!optimizeRuns) return best;
+
+  // A zero run may use a literal, repeat the preceding zero, or use either zero
+  // repeat instruction. Find its cheapest encoding at current Huffman prices.
+  const runs = new Uint16Array(sequence.length);
+  for (let i = sequence.length - 1; i >= 0; i--) {
+    runs[i] = 1 + (sequence[i] === sequence[i + 1] ? runs[i + 1] : 0);
+  }
+  const starts = [
+    Array(19).fill(5),
+    Array.from({ length: 19 }, (_, i) => i < 16 ? 6 : 3),
+  ];
+  for (let prices of starts) {
+    for (let pass = 0; pass < 4; pass++) {
+      const costs = new Uint16Array(sequence.length + 1);
+      const kinds = new Uint8Array(sequence.length);
+      const lengths = new Uint8Array(sequence.length);
+      for (let i = sequence.length - 1; i >= 0; i--) {
+        const literal = sequence[i];
+        let bestCost = prices[literal] + costs[i + 1];
+        let kind = literal, length = 1;
+        function compare(symbol, minimum, maximum, extraBits) {
+          const limit = Math.min(maximum, runs[i]);
+          for (let n = minimum; n <= limit; n++) {
+            const cost = costs[i + n] + prices[symbol] + extraBits;
+            if (cost < bestCost) {
+              bestCost = cost;
+              kind = symbol;
+              length = n;
+            }
+          }
+        }
+        if (i && sequence[i - 1] === literal) compare(16, 3, 6, 2);
+        if (literal === 0) {
+          compare(17, 3, 10, 3);
+          compare(18, 11, 138, 7);
+        }
+        costs[i] = bestCost;
+        kinds[i] = kind;
+        lengths[i] = length;
+      }
+      const tokens = [];
+      for (let i = 0; i < sequence.length; i += lengths[i]) {
+        const symbol = kinds[i];
+        const bits = symbol === 16 ? 2 : symbol === 17 ? 3 : symbol === 18 ? 7 : 0;
+        const value = bits ? lengths[i] - (symbol === 18 ? 11 : 3) : 0;
+        tokens.push({ s: symbol, v: value, b: bits });
+      }
+      const trial = write(tokens);
+      if (trial.writer.at < best.at) best = trial.writer;
+      const next = Array.from(trial.prices, (price) => price || 7);
+      if (next.every((price, i) => price === prices[i])) break;
+      prices = next;
+    }
+  }
+  return best;
 }
-function chooseCodebook(raw, start, end, lengthPath, distancePath, block, cost) {
+function chooseCodebook(raw, start, end, lengthPath, distancePath, block) {
   const litCounts = new Uint32Array(286),
     distCounts = new Uint32Array(30);
   let extra = 0;
@@ -121,7 +180,14 @@ function chooseCodebook(raw, start, end, lengthPath, distancePath, block, cost) 
   let total = header.at + extra;
   for (let i = 0; i < lit.length; i++) total += litCounts[i] * lit[i];
   for (let i = 0; i < dist.length; i++) total += distCounts[i] * dist[i];
-  if (total < block.dataStart - block.header + cost + block.literal.lens[256])
+  let current = block.dataStart - block.header + extra;
+  for (let i = 0; i < litCounts.length; i++) {
+    if (litCounts[i]) current += litCounts[i] * (block.literal.lens[i] || Infinity);
+  }
+  for (let i = 0; i < distCounts.length; i++) {
+    if (distCounts[i]) current += distCounts[i] * (block.distance.lens[i] || Infinity);
+  }
+  if (total < current)
     return { header, literal: prefixTree(lit, false), distance: prefixTree(dist, false) };
   return null;
 }
@@ -320,7 +386,7 @@ function readPlan(packed, rawSize, retainBlocks) {
       pos += len;
     }
     if (retainBlocks)
-      blocks.push({ header, dataStart, type, start, end: pos, final, literal, distance });
+      blocks.push({ header, dataStart, dataEnd: reader.at, type, start, end: pos, final, literal, distance });
     if (pos > rawSize || reader.at > 8 * bytes.length) throw Error('Stream exceeds expected size.');
   } while (!final);
   if (pos !== rawSize || Math.ceil(reader.at / 8) !== bytes.length)
@@ -337,8 +403,11 @@ function printSymbol(writer, tree, s) {
   if (!n) throw Error('Absent symbol in chosen block.');
   writer.write(tree.reverse[s], n);
 }
-function extendMatch(raw, pos, dist, known, max) {
+function extendMatch(raw, runs, pos, dist, known, max) {
   let z = known;
+  if (runs[pos] > z && raw[pos] === raw[pos - dist]) {
+    z = Math.max(z, Math.min(max, runs[pos], runs[pos - dist]));
+  }
   while (
     z + 4 <= max &&
     raw[pos + z] === raw[pos + z - dist] &&
@@ -353,20 +422,27 @@ function extendMatch(raw, pos, dist, known, max) {
 // Reparse several native LZ77 factorizations under the starter stream's exact
 // Huffman prices. Every old match and literal remains available. Matches found
 // by another parser can be shortened or extended anywhere they overlap a cut.
-function reprice(raw, base, alternateStreams, prior, depthLimit) {
+function reprice(raw, base, alternateStreams, prior, runs, depthLimit) {
   const plans = [
     readPlan(base, raw.length, true),
     ...alternateStreams.map((x) => readPlan(x, raw.length, false)),
   ];
   const blocks = plans[0].blocks;
   const events = new Uint8Array(raw.length);
-  for (const p of plans)
-    for (let j = 0; j < p.positions.length; j++) {
-      const at = p.positions[j];
-      events[at] = 1;
-      if (at + 1 < raw.length) events[at + 1] = 1;
-      if (at > 0) events[at - 1] = 1;
+  for (const plan of plans) {
+    for (let j = 0; j < plan.positions.length; j++) {
+      const at = plan.positions[j], end = at + plan.lengths[j];
+      for (let p = Math.max(0, at - 4); p <= Math.min(raw.length - 1, at + 4); p++) events[p] = 1;
+      if (end < raw.length) events[end] = 1;
+      if (end > 2) events[end - 2] = 1;
+      if (end > 4) events[end - 4] = 1;
     }
+  }
+  if (base.length < 85000) {
+    for (let i = 1; i + 2 < raw.length; i++) {
+      if (raw[i - 1] !== raw[i] || runs[i] <= 3 || (i & 31) === 0) events[i] = 1;
+    }
+  }
   const costs = new Int32Array(raw.length + 1),
     lengthPath = new Uint16Array(raw.length),
     distancePath = new Uint16Array(raw.length);
@@ -384,24 +460,23 @@ function reprice(raw, base, alternateStreams, prior, depthLimit) {
   for (const block of blocks) {
     const { start, end, type, final, literal, distance } = block;
     if (type === 0) {
-      writer.write(final, 1);
-      writer.write(0, 2);
-      writer.write(0, (8 - (writer.at & 7)) & 7);
-      writer.write(end - start, 16);
-      writer.write((end - start) ^ 65535, 16);
-      for (let i = start; i < end; i++) writer.write(raw[i], 8);
+      writeStored(writer, raw, start, end, final);
       continue;
     }
+    // Price unused symbols provisionally. Before emitting the chosen tokens,
+    // chooseCodebook checks that every symbol has an actual output code.
+    const literalPrices = Uint8Array.from({ length: 286 }, (_, i) => literal.lens[i] || (i < 256 ? 12 : 10));
+    const distancePrices = Uint8Array.from({ length: 30 }, (_, i) => distance.lens[i] || 8);
     const minDistanceCost = new Uint8Array(31);
     minDistanceCost[30] = 255;
     for (let k = 29; k >= 0; k--) {
-      const bits = distance.lens[k];
+      const bits = distancePrices[k];
       minDistanceCost[k] = Math.min(minDistanceCost[k + 1], bits ? bits + distanceExtra[k] : 255);
     }
     const lenCost = new Int32Array(259);
     for (let j = 3; j <= 258; j++) {
       const sym = symbolForLength[j],
-        l = literal.lens[sym];
+        l = literalPrices[sym];
       lenCost[j] = l ? l + lengthExtra[sym - 257] : high;
     }
     for (let s = 0; s < plans.length; s++) {
@@ -412,8 +487,31 @@ function reprice(raw, base, alternateStreams, prior, depthLimit) {
       cursors[s] = idx - 1;
     }
     costs[end] = 0;
+    const minima = Array.from({ length: 6 }, () => new Int32Array(512));
+    // Record the cheapest suffix in the next 1, 2, 4, 8, 16 and 32 bytes. A
+    // DEFLATE length symbol never covers a wider interval than 32 lengths.
+    function remember(pos) {
+      let selected = pos;
+      const slot = pos & 511;
+      minima[0][slot] = pos;
+      for (let level = 1, half = 1; level < 6; level++, half <<= 1) {
+        if (pos + half <= end) {
+          const other = minima[level - 1][(pos + half) & 511];
+          if (costs[other] < costs[selected]) selected = other;
+        }
+        minima[level][slot] = selected;
+      }
+    }
+    function minimumPosition(left, right) {
+      const level = 31 - Math.clz32(right - left + 1);
+      const a = minima[level][left & 511];
+      const b = minima[level][(right - (1 << level) + 1) & 511];
+      return costs[a] <= costs[b] ? a : b;
+    }
+    const prefixCosts = new Int32Array(29), prefixLengths = new Uint16Array(29);
+    remember(end);
     for (let at = end - 1; at >= start; at--) {
-      const literalCost = literal.lens[raw[at]];
+      const literalCost = literalPrices[raw[at]];
       let best = literalCost ? Math.min(high, costs[at + 1] + literalCost) : high,
         bestLength = 0,
         bestDistance = 0;
@@ -431,7 +529,7 @@ function reprice(raw, base, alternateStreams, prior, depthLimit) {
           if (remaining <= 0) continue;
           const dist = plan.distances[idx],
             distanceSymbol = symbolForDistance[dist],
-            symbolCost = distance.lens[distanceSymbol];
+            symbolCost = distancePrices[distanceSymbol];
           if (!symbolCost) continue;
           let alreadySeen = false;
           for (let j = 0; j < count; j++)
@@ -441,7 +539,7 @@ function reprice(raw, base, alternateStreams, prior, depthLimit) {
             }
           if (alreadySeen) continue;
           const limit = Math.min(258, end - at);
-          const len = extendMatch(raw, at, dist, Math.min(remaining, limit), limit);
+          const len = extendMatch(raw, runs, at, dist, Math.min(remaining, limit), limit);
           if (len < 3) continue;
           candidates[count] = dist;
           reach[count] = len;
@@ -461,7 +559,7 @@ function reprice(raw, base, alternateStreams, prior, depthLimit) {
         ) {
           const dist = at - last,
             distanceSymbol = symbolForDistance[dist],
-            distanceBits = distance.lens[distanceSymbol];
+            distanceBits = distancePrices[distanceSymbol];
           if (fullCost <= minDistanceCost[distanceSymbol]) break;
           if (!distanceBits) continue;
           const distancePrice = distanceBits + distanceExtra[distanceSymbol];
@@ -483,7 +581,7 @@ function reprice(raw, base, alternateStreams, prior, depthLimit) {
             raw[last + 2] !== raw[at + 2]
           )
             continue;
-          const n = extendMatch(raw, at, dist, 3, limit);
+          const n = extendMatch(raw, runs, at, dist, 3, limit);
           if (n <= minimumLength) continue;
           candidates[count] = dist;
           reach[count] = n;
@@ -491,7 +589,7 @@ function reprice(raw, base, alternateStreams, prior, depthLimit) {
           max = Math.max(max, n);
           if (n === limit) fullCost = Math.min(fullCost, distancePrice);
         }
-        if (count) {
+        if (count && max <= 28) {
           let v = high,
             chosen = 0;
           for (let j = 3; j <= max; j++) {
@@ -512,15 +610,45 @@ function reprice(raw, base, alternateStreams, prior, depthLimit) {
               bestDistance = candidates[j];
             }
           }
+        } else if (count) {
+          let prefixCost = high, selected = 0;
+          const lastSymbol = symbolForLength[max] - 257;
+          for (let k = 0; k <= lastSymbol; k++) {
+            prefixCosts[k] = prefixCost;
+            prefixLengths[k] = selected;
+            if (k === lastSymbol) break;
+            const left = lengthBase[k], right = lengthBase[k + 1] - 1;
+            const pos = minimumPosition(at + left, at + right);
+            const price = costs[pos] + lenCost[left];
+            if (price < prefixCost) {
+              prefixCost = price;
+              selected = pos - at;
+            }
+          }
+          for (let j = 0; j < count; j++) {
+            const cap = reach[j], k = symbolForLength[cap] - 257, left = lengthBase[k];
+            const pos = minimumPosition(at + left, at + cap);
+            let price = costs[pos] + lenCost[left], length = pos - at;
+            if (prefixCosts[k] <= price) {
+              price = prefixCosts[k];
+              length = prefixLengths[k];
+            }
+            if (price + prices[j] < best) {
+              best = price + prices[j];
+              bestLength = length;
+              bestDistance = candidates[j];
+            }
+          }
         }
       }
       costs[at] = best;
+      remember(at);
       lengthPath[at] = bestLength;
       distancePath[at] = bestDistance;
     }
     if (costs[start] >= high) throw Error('Lost the input parse.');
 
-    const improved = chooseCodebook(raw, start, end, lengthPath, distancePath, block, costs[start]);
+    const improved = chooseCodebook(raw, start, end, lengthPath, distancePath, block);
     if (improved) writer.copy(new BitReader(improved.header.bytes), 0, improved.header.at);
     else writer.copy(reader, block.header, block.dataStart);
     const literalOut = improved?.literal || literal,
@@ -800,6 +928,43 @@ function repartition(raw, base, grain = 320) {
   return out.length < base.length ? out : base;
 }
 
+// Shrinking a dynamic header can change the alignment of later stored blocks.
+function writeStored(writer, raw, start, end, final) {
+  writer.write(final, 1);
+  writer.write(0, 2);
+  writer.write(0, (8 - (writer.at & 7)) & 7);
+  writer.write(end - start, 16);
+  writer.write((end - start) ^ 65535, 16);
+  for (let i = start; i < end; i++) writer.write(raw[i], 8);
+}
+
+function tuneHeaders(raw, base) {
+  const { blocks } = readPlan(base, raw.length, true);
+  const reader = new BitReader(base.subarray(2, -4));
+  const writer = new BitWriter(base.length);
+  for (const block of blocks) {
+    if (block.type === 0) {
+      writeStored(writer, raw, block.start, block.end, block.final);
+      continue;
+    }
+    const trial = block.type === 2
+      ? encodeCodebook(block.literal.lens, block.distance.lens, block.final, true)
+      : null;
+    if (trial && trial.at < block.dataStart - block.header) {
+      writer.copy(new BitReader(trial.bytes), 0, trial.at);
+    } else {
+      writer.copy(reader, block.header, block.dataStart);
+    }
+    writer.copy(reader, block.dataStart, block.dataEnd);
+  }
+  const result = Buffer.concat([
+    base.subarray(0, 2),
+    writer.bytes.subarray(0, (writer.at + 7) >>> 3),
+    base.subarray(-4),
+  ]);
+  return result.length < base.length ? result : base;
+}
+
 export function repack(raw, packed) {
   // Compare alternate parses of this filtered image. The first pass keeps the
   // original block boundaries. The second uses the least expensive partition.
@@ -809,9 +974,15 @@ export function repack(raw, packed) {
     { level: 9, memLevel: 9 },
   ].map((options) => deflateSync(raw, options));
   const prior = priorOccurrences(raw);
-  const first = reprice(raw, packed, alternatives, prior, 48);
+  const runs = new Uint16Array(raw.length);
+  for (let i = raw.length - 1; i >= 0; i--) {
+    runs[i] = raw[i] === raw[i + 1] ? Math.min(258, runs[i + 1] + 1) : 1;
+  }
+  const depth = packed.length > 180000 ? 48 : 96;
+  const first = reprice(raw, packed, alternatives, prior, runs, depth);
   const grouped = repartition(raw, first, 240);
-  // Limit work on dense images. Fewer hash-chain probes do not affect decoding.
-  if (packed.length > 180000) return grouped;
-  return reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, 48);
+  const final = packed.length > 180000
+    ? grouped
+    : reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, depth);
+  return tuneHeaders(raw, final);
 }

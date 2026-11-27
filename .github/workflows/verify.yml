@@ -1,7 +1,7 @@
 name: Verify screenshot compression
 on:
   push:
-    branches: [bench-png-adaptive-filter-path]
+    branches: [bench-png-common-displacements]
 permissions:
   contents: read
 jobs:

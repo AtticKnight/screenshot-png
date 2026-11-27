@@ -525,7 +525,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
     reader = new BitReader(base.subarray(2, -4));
   const streamEnds = plans.map(() => 0),
     cursors = new Int32Array(plans.length);
-  const capacity = plans.length + depthLimit + 13 + prior.rows.length;
+  const capacity = plans.length + depthLimit + 21 + prior.rows.length;
   const candidates = new Uint16Array(capacity),
     reach = new Uint16Array(capacity),
     prices = new Uint16Array(capacity);
@@ -559,13 +559,28 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
         l = literalPrices[sym];
       lenCost[j] = l ? l + lengthBits[sym - 257] : high;
     }
+    // UI elements can recur at a useful displacement that is neither a full
+    // row nor the nearest occurrence of their first three bytes. Keep a small
+    // set of common displacements from independent parses of this block.
+    const displacementWeights = new Map();
     for (let s = 0; s < plans.length; s++) {
-      const a = plans[s].positions;
+      const plan = plans[s];
       let idx = streamEnds[s];
-      while (idx < a.length && a[idx] < end) idx++;
+      while (idx < plan.positions.length && plan.positions[idx] < end) {
+        const dist = plan.distances[idx], length = plan.lengths[idx];
+        if (dist >= 8 && length >= 5) {
+          const weight = Math.min(48, length) * (s === 0 ? 2 : 1);
+          displacementWeights.set(dist, (displacementWeights.get(dist) || 0) + weight);
+        }
+        idx++;
+      }
       streamEnds[s] = idx;
       cursors[s] = idx - 1;
     }
+    const frequent = [...displacementWeights]
+      .filter(([d, weight]) => weight >= 75 && !prior.rows.includes(d))
+      .sort((a, b) => b[1] - a[1] || a[0] - b[0]).slice(0, 8).map(([d]) => d);
+    const usefulDistances = [...prior.rows, ...frequent].sort((a, b) => a - b);
     costs[end] = 0;
     const suffixMinimum = new Int32Array(512), prefixMinimum = new Int32Array(512);
     function remember(pos) {
@@ -647,7 +662,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
         for (let j = 0; j < count; j++)
           if (reach[j] === limit) fullCost = Math.min(fullCost, prices[j]);
         // Aligned scanlines can be farther back than the nearest hash-chain entries.
-        for (const dist of prior.rows) {
+        for (const dist of usefulDistances) {
           if (dist > at) break;
           const price = distancePrices[symbolForDistance[dist]] + distanceBitsForSymbol[symbolForDistance[dist]];
           if (fullCost <= price) continue;

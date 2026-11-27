@@ -1,5 +1,6 @@
 import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
 import { compressOptimally } from './optimal.js';
+import { repack } from './repack.js';
 
 
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -227,6 +228,38 @@ function chooseStrips(streams, w, h, channels, stripHeight, history, level) {
   return selected;
 }
 
+// Change a band only when its neighboring rows still compress well across both
+// edges. Keeping the rest of a strong layout fixed preserves long-distance matches.
+function polishStrips(base, sources, width, height, channels, rows) {
+  const stride = width * channels + 1;
+  const result = Buffer.from(base);
+  for (let y = 0; y < height; y += rows) {
+    const start = y * stride, end = Math.min(height, y + rows) * stride;
+    const warmStart = Math.max(0, start - 2 * stride);
+    const left = result.subarray(warmStart, start);
+    const right = base.subarray(end, Math.min(base.length, end + 3 * stride));
+    const options = { level: 6, memLevel: 8 };
+    if (warmStart) options.dictionary = result.subarray(Math.max(0, warmStart - 32768), warmStart);
+    const size = (strip) => deflateRawSync(Buffer.concat([left, strip, right]), options).length;
+    const original = base.subarray(start, end);
+    const originalSize = size(original);
+    const seen = [original];
+    let best = original, bestSize = originalSize;
+    for (const source of sources) {
+      const strip = source.subarray(start, end);
+      if (seen.some((previous) => previous.equals(strip))) continue;
+      seen.push(strip);
+      const bytes = size(strip);
+      if (bytes < bestSize) {
+        best = strip;
+        bestSize = bytes;
+      }
+    }
+    if (bestSize + 12 < originalSize) best.copy(result, start);
+  }
+  return result;
+}
+
 export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
@@ -280,8 +313,30 @@ export function encodeScreenshot(file) {
     raw,
     bytes: refine(raw, image, data => deflateSync(data, { level: 9, memLevel: 9 })),
   })).sort((a, b) => a.bytes - b.bytes);
-  // The first pass compares layout sizes cheaply. A near-optimal DEFLATE
-  // parse on the two shortest gives each a chance with a richer cost model.
-  for (const { raw } of ranked.slice(0, 2)) refine(raw, image, compressOptimally);
+  const bestSize = ranked[0].bytes;
+  const limit = bestSize > 180000 ? 1 : 2;
+  const finalists = ranked.slice(0, limit);
+  if (bestSize <= 175000) {
+    const rows = image.mode === 0 || image.mode === 4 ? 5 : 8;
+    const sources = [...alternatives, ...ranked.map((candidate) => candidate.raw)];
+    const polished = polishStrips(ranked[0].raw, sources, width, height, image.channels, rows);
+    if (!ranked.some((candidate) => candidate.raw.equals(polished))) {
+      const bytes = refine(polished, image, (data) => deflateSync(data, { level: 9, memLevel: 9 }));
+      if (bytes <= bestSize * 1.005) {
+        finalists.push({ raw: polished, bytes });
+        finalists.sort((a, b) => a.bytes - b.bytes);
+      }
+    }
+  }
+  let winner;
+  for (const { raw } of finalists.slice(0, limit)) {
+    const packed = compressOptimally(raw);
+    if (packed && (!winner || packed.length < winner.packed.length)) winner = { raw, packed };
+  }
+  if (winner) {
+    const packed = repack(winner.raw, winner.packed);
+    const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
+    if (png.length < result.length) result = png;
+  }
   return result;
 }

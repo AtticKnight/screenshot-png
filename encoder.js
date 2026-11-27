@@ -1,6 +1,6 @@
 import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
 
-import { compressOptimally } from './optimal.js';
+import { compressWithZopfli } from './zopfli.js';
 
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -247,7 +247,7 @@ export function encodeScreenshot(file) {
   const strongest = candidates[0];
   let result = strongest.png;
   function refine(raw, image) {
-    const packed = compressOptimally(raw);
+    const packed = compressWithZopfli(raw);
     if (!packed) return;
     const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
     if (png.length < result.length) result = png;
@@ -262,6 +262,6 @@ export function encodeScreenshot(file) {
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
   const ranked = distinct.map(raw => ({ raw, size: deflateSync(raw, {level:9}).length }))
     .sort((a, b) => a.size - b.size);
-  for (const candidate of ranked.slice(0, 2)) refine(candidate.raw, image);
+  refine(ranked[0].raw, image);
   return result;
 }

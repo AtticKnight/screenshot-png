@@ -1,0 +1,49 @@
+name: Benchmark Zopfli on screenshot scanlines
+on:
+  push:
+    branches: [zopfli-experiment]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: google/zopfli
+          ref: bd64b2f0553d4f1ef4e6627647c5d9fc8c71ffc0
+          path: zopfli-source
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - name: Build pinned Zopfli and check the zlib stream
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends emscripten
+          sh build/zopfli.sh zopfli-source
+          wc -c vendor/zopfli.cjs
+          sha256sum vendor/zopfli.cjs
+          node --input-type=module - <<'JS'
+          import assert from 'node:assert/strict';
+          import { inflateSync } from 'node:zlib';
+          import { compressWithZopfli } from './zopfli.js';
+          const raw = Buffer.from('the original raw image row '.repeat(200));
+          const encoded = compressWithZopfli(raw);
+          assert.deepEqual(inflateSync(encoded),raw);
+          console.log('Verified Zopfli zlib stream',raw.length,encoded.length);
+          JS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zopfli-javascript
+          path: |
+            vendor/zopfli.cjs
+            vendor/ZOPFLI-LICENSE
+      - name: Download the published practice set
+        run: python3 check/fetch.py
+      - name: Measure a single compression pass on all eight screenshots
+        run: node check/zopfli-practice.mjs

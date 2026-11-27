@@ -273,7 +273,7 @@ export function encodeScreenshot(file) {
       }
     }
   }
-  if (gray) compare(directImage(pixels, opaque ? 0 : 4), 3);
+  if (gray) compare(directImage(pixels, opaque ? 0 : 4), 4);
   // A dense gray ramp already has an ordered one-byte representation.
   if (indexed && (!gray || counts.size < 96)) {
     const colors = Array.from(counts.keys());
@@ -285,7 +285,7 @@ export function encodeScreenshot(file) {
     if (frequent.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, frequent));
   }
   // Small opaque flat palettes avoid repeating a full three-channel filter search.
-  if (!gray && (!indexed || !opaque || counts.size > 64)) compare(directImage(pixels, opaque ? 2 : 6), 2);
+  if (!gray && (!indexed || !opaque || counts.size > 64)) compare(directImage(pixels, opaque ? 2 : 6), 4);
   let result = strongest.png;
   function refine(raw, image, compressor) {
     const packed = compressor(raw);
@@ -297,18 +297,15 @@ export function encodeScreenshot(file) {
   const image = strongest.image;
   const alternatives = chosenStreams;
   const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
-  const dense = strongest.png.length > width * height * 0.21;
-  const layouts = [strongest.raw, wide];
-  if (!dense) {
-    layouts.push(chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3));
-  }
+  const narrow = chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3);
+  const layouts = [strongest.raw, wide, narrow];
   // A long strip keeps one predictor across repeated shapes. Dense RGB data
   // changes faster, so compare shorter strips against the full 32 KiB history.
   // Grayscale samples can switch predictors on each row at lower search cost.
   if (image.mode !== 3) {
     const denseRgb = image.mode === 2 && strongest.png.length > width * height * 0.30;
-    const rows = image.mode === 0 || image.mode === 4 ? 1 : denseRgb ? 4 : 16;
-    const level = rows === 1 ? 3 : rows === 4 ? 4 : 6;
+    const rows = image.mode === 0 || image.mode === 4 ? 1 : denseRgb ? 2 : 16;
+    const level = rows === 1 ? 3 : rows === 2 ? 5 : 7;
     layouts.push(chooseStrips(alternatives, width, height, image.channels, rows, 32768, level));
   }
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
@@ -317,20 +314,27 @@ export function encodeScreenshot(file) {
     bytes: refine(raw, image, data => deflateSync(data, { level: 9, memLevel: 9 })),
   })).sort((a, b) => a.bytes - b.bytes);
   const bestSize = ranked[0].bytes;
-  let raw = ranked[0].raw;
-  if (bestSize <= 85000) {
+  const limit = bestSize < 40000 && image.mode === 0 ? 2 : 1;
+  const finalists = ranked.slice(0, limit);
+  if (bestSize <= 175000) {
     const rows = image.mode === 0 || image.mode === 4 ? 5 : 8;
     const sources = [...alternatives, ...ranked.map((candidate) => candidate.raw)];
     const polished = polishStrips(ranked[0].raw, sources, width, height, image.channels, rows);
     if (!ranked.some((candidate) => candidate.raw.equals(polished))) {
       const bytes = refine(polished, image, (data) => deflateSync(data, { level: 9, memLevel: 9 }));
-      if (bytes < bestSize) raw = polished;
+      if (bytes <= bestSize * 1.005) {
+        finalists.push({ raw: polished, bytes });
+        finalists.sort((a, b) => a.bytes - b.bytes);
+      }
     }
   }
-  // One level-12 parse per image bounds the dominant compression work on dense sets.
-  const candidate = compressOptimally(raw);
-  if (candidate) {
-    const packed = repack(raw, candidate);
+  let winner;
+  for (const { raw } of finalists.filter(layout => layout.bytes <= bestSize * 1.02).slice(0, limit)) {
+    const packed = compressOptimally(raw);
+    if (packed && (!winner || packed.length < winner.packed.length)) winner = { raw, packed };
+  }
+  if (winner) {
+    const packed = repack(winner.raw, winner.packed, width * image.channels + 1);
     const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
     if (png.length < result.length) result = png;
   }

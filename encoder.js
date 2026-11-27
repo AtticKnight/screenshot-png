@@ -376,6 +376,46 @@ function polishBoundaryRows(base, streams, width, height, channels) {
   return result;
 }
 
+// Estimate the entropy of each filtered scanline, including how its byte
+// distribution depends on the previous row and the byte to the left.
+function entropyRows(streams, width, height, channels) {
+  const stride = width * channels + 1;
+  const result = Buffer.allocUnsafe(height * stride);
+  const step = width >= 800 ? 3 : 2;
+  const entropyStep = new Float64Array(stride + 1);
+  for (let n = 1; n <= stride; n++) {
+    entropyStep[n] = n * Math.log2(n) - (n - 1) * Math.log2(Math.max(1, n - 1));
+  }
+  const counts = new Uint16Array(256);
+  const contexts = new Uint16Array(8);
+  const pairs = new Uint16Array(8 * 256);
+  for (let row = 0; row < height; row++) {
+    const at = row * stride;
+    let best = Infinity, filter = 0;
+    for (let f = 0; f < 5; f++) {
+      const source = streams[f];
+      counts.fill(0); contexts.fill(0); pairs.fill(0);
+      let symbols = 0, conditional = 0, contextTotal = 0;
+      for (let x = row % step; x < width; x += step) {
+        for (let c = 0; c < channels; c++) {
+          const pos = at + 1 + x * channels + c;
+          const value = source[pos];
+          const left = x ? source[pos - channels] : 0;
+          const above = row ? result[pos - stride] : 0;
+          const context = (left === 0 ? 1 : 0) | (above === 0 ? 2 : 0) | (above === left ? 4 : 0);
+          symbols += entropyStep[++counts[value]];
+          contextTotal += entropyStep[++contexts[context]];
+          conditional += entropyStep[++pairs[context * 256 + value]];
+        }
+      }
+      const cost = -0.55 * symbols + 0.45 * (contextTotal - conditional);
+      if (cost < best) { best = cost; filter = f; }
+    }
+    streams[filter].copy(result, at, at, at + stride);
+  }
+  return result;
+}
+
 export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
@@ -415,6 +455,7 @@ export function encodeScreenshot(file) {
   const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
   const narrow = chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3);
   const layouts = [strongest.raw, wide, narrow];
+  layouts.push(entropyRows(alternatives, width, height, image.channels));
   // A long strip keeps one predictor across repeated shapes. Dense RGB data
   // changes faster, so compare shorter strips against the full 32 KiB history.
   // Grayscale samples can switch predictors on each row at lower search cost.

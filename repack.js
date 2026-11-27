@@ -819,8 +819,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
 
 // Give literals and matches one slot each, so the block search can move a cut
 // without splitting a match or changing the decoded bytes.
-function tokenize(raw, packed) {
-  const plan = readPlan(packed, raw.length, true);
+function tokenize(raw, packed, plan = readPlan(packed, raw.length, true)) {
   let size = raw.length;
   for (const n of plan.lengths) size -= n - 1;
   const symbols = new Uint16Array(size),
@@ -988,28 +987,29 @@ function segmentPlan(tokens, start, end, memo) {
   memo.set(key, out);
   return out;
 }
+function emitSegment(w, b, tokens, final) {
+  if (b.header) {
+    w.write(final, 1);
+    w.copy(new BitReader(b.header.bytes), 1, b.header.at);
+  } else {
+    w.write(final, 1);
+    w.write(1, 2);
+  }
+  for (let i = b.start; i < b.end; i++) {
+    const s = tokens.symbols[i];
+    printSymbol(w, b.literal, s);
+    if (s < 257) continue;
+    const d = tokens.distanceSymbols[i] - 1;
+    w.write(tokens.len[i] - lengthBase[s - 257], lengthExtra[s - 257]);
+    printSymbol(w, b.distance, d);
+    w.write(tokens.dist[i] - distanceBase[d], distanceExtra[d]);
+  }
+  printSymbol(w, b.literal, 256);
+}
 function writeSegments(tokens, layout, base) {
   const w = new BitWriter(base.length);
   for (let j = 0; j < layout.length; j++) {
-    const b = layout[j],
-      final = j === layout.length - 1 ? 1 : 0;
-    if (b.header) {
-      w.write(final, 1);
-      w.copy(new BitReader(b.header.bytes), 1, b.header.at);
-    } else {
-      w.write(final, 1);
-      w.write(1, 2);
-    }
-    for (let i = b.start; i < b.end; i++) {
-      const s = tokens.symbols[i];
-      printSymbol(w, b.literal, s);
-      if (s < 257) continue;
-      const d = tokens.distanceSymbols[i] - 1;
-      w.write(tokens.len[i] - lengthBase[s - 257], lengthExtra[s - 257]);
-      printSymbol(w, b.distance, d);
-      w.write(tokens.dist[i] - distanceBase[d], distanceExtra[d]);
-    }
-    printSymbol(w, b.literal, 256);
+    emitSegment(w, layout[j], tokens, j === layout.length - 1 ? 1 : 0);
   }
   return Buffer.concat([
     base.subarray(0, 2),
@@ -1233,8 +1233,94 @@ function tuneHeaders(raw, base) {
   return result.length < base.length ? result : base;
 }
 
+// Find a change in the local literal and distance distributions without changing
+// any LZ match. Screenshots often switch abruptly from text to a photo or gradient.
+function estimateInternalCut(tokens, start, end, logCount) {
+  const length = end - start;
+  if (length < 1000) return undefined;
+  const left = new Int32Array(316), right = new Int32Array(316);
+  let distances = 0;
+  for (let i = start; i < end; i++) {
+    right[tokens.symbols[i]]++;
+    const d = tokens.distanceSymbols[i];
+    if (d) { right[285 + d]++; distances++; }
+  }
+  let rightTerms = 0, leftTerms = 0, movedDistances = 0;
+  for (const count of right) rightTerms += logCount[count];
+  const original = logCount[length] + logCount[distances] - rightTerms;
+  const step = Math.max(64, Math.ceil(length / 72));
+  let bestGain = 0, bestCut = start;
+  function move(symbol) {
+    const a = left[symbol]++, b = right[symbol]--;
+    leftTerms += logCount[a + 1] - logCount[a];
+    rightTerms += logCount[b - 1] - logCount[b];
+  }
+  for (let i = start; i < end - 120; i++) {
+    move(tokens.symbols[i]);
+    if (tokens.distanceSymbols[i]) {
+      move(285 + tokens.distanceSymbols[i]);
+      movedDistances++;
+    }
+    const n = i + 1 - start;
+    if (n < 120 || n % step !== 0) continue;
+    const splitCost = logCount[n] + logCount[length - n] +
+      logCount[movedDistances] + logCount[distances - movedDistances] - leftTerms - rightTerms;
+    const gain = original - splitCost;
+    if (gain > bestGain) { bestGain = gain; bestCut = i + 1; }
+  }
+  return bestGain > 170 ? { start, end, cut: bestCut, step, gain: bestGain } : undefined;
+}
+
+// Preserve every original block that cannot be written in fewer bits. Stored
+// blocks retain their alignment when a preceding dynamic block changes length.
+function splitDenseBlocks(raw, base) {
+  const plan = readPlan(base, raw.length, true), tokens = tokenize(raw, base, plan);
+  const marks = [0, ...tokens.blockMarks, tokens.size];
+  if (marks.length !== plan.blocks.length + 1) return base;
+  const logCount = new Float64Array(Math.max(...marks.slice(1).map((m,i) => m - marks[i])) + 1);
+  for (let n = 1; n < logCount.length; n++) logCount[n] = n * Math.log2(n);
+  const proposals = [];
+  for (let i = 0; i < plan.blocks.length; i++) {
+    if (plan.blocks[i].type === 0) continue;
+    const p = estimateInternalCut(tokens, marks[i], marks[i + 1], logCount);
+    if (p) proposals.push({ ...p, blockIndex: i });
+  }
+  const changes = new Map(), memo = new Map();
+  for (const p of proposals.sort((a,b) => b.gain - a.gain).slice(0, 18)) {
+    const b = plan.blocks[p.blockIndex];
+    let size = b.dataEnd - b.header;
+    const delta = Math.max(1, Math.floor(p.step / 2));
+    for (const cut of [p.cut, p.cut - delta, p.cut + delta]) {
+      if (cut <= p.start || cut >= p.end) continue;
+      const first = segmentPlan(tokens, p.start, cut, memo);
+      const second = segmentPlan(tokens, cut, p.end, memo);
+      if (first.bits + second.bits < size) {
+        changes.set(p.blockIndex, [first, second]);
+        size = first.bits + second.bits;
+      }
+    }
+  }
+  if (!changes.size) return base;
+  const w = new BitWriter(base.length), old = new BitReader(base.subarray(2, -4));
+  for (let i = 0; i < plan.blocks.length; i++) {
+    const b = plan.blocks[i], parts = changes.get(i);
+    if (parts) {
+      emitSegment(w, parts[0], tokens, 0);
+      emitSegment(w, parts[1], tokens, b.final);
+    } else if (b.type === 0) {
+      writeStored(w, raw, b.start, b.end, b.final);
+    } else {
+      w.copy(old, b.header, b.dataEnd);
+    }
+  }
+  const compressed = Buffer.concat([
+    base.subarray(0, 2), w.bytes.subarray(0, (w.at + 7) >>> 3), base.subarray(-4),
+  ]);
+  return compressed.length < base.length ? compressed : base;
+}
+
 export function repack(raw, packed, stride = 0) {
-  if (packed.length > 245000) return tuneHeaders(raw, packed);
+  if (packed.length > 245000) return splitDenseBlocks(raw, tuneHeaders(raw, packed));
   if (packed.length > 175000) return tuneHeaders(raw, repartition(raw, packed, 460));
   const alternatives = [
     deflateSync(raw, { level: 1, memLevel: 9 }),

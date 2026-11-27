@@ -325,6 +325,57 @@ function chooseFilterPath(streams, width, height, channels, guide) {
   return Buffer.concat(selected.reverse(), stride * height);
 }
 
+// Revisit individual scanlines where the chosen predictor has expensive
+// residuals compared with its alternatives. Test the actual byte stream on
+// both sides of the row against the same 32 KiB history before changing it.
+function polishBoundaryRows(base, streams, width, height, channels) {
+  const stride = width * channels + 1;
+  const bands = [];
+  for (let from = 0; from < height; from += 20) {
+    let bestRow = -1, bestGain = 0;
+    for (let y = from; y < Math.min(height, from + 20); y++) {
+      const start = y * stride, current = base[start];
+      let lowest = Infinity, original = 0;
+      for (let f = 0; f < 5; f++) {
+        const data = streams[f];
+        let score = 0;
+        for (let x = 1 + channels; x < stride; x += 11 * channels) {
+          for (let c = 0; c < channels && x + c < stride; c++) {
+            const pos = start + x + c, value = data[pos];
+            if (!value) continue;
+            score += value === data[pos - channels] || (y && value === base[pos - stride])
+              ? 1 : 5 + tokenCost[value];
+          }
+        }
+        if (f === current) original = score;
+        lowest = Math.min(lowest, score);
+      }
+      const transition = (y && base[start - stride] !== current) ||
+        (y + 1 < height && base[start + stride] !== current);
+      const gain = original - lowest + (transition ? 4 : 0);
+      if (gain > bestGain) { bestGain = gain; bestRow = y; }
+    }
+    if (bestRow >= 0) bands.push(bestRow);
+  }
+  const result = Buffer.from(base);
+  for (const row of bands) {
+    const offset = row * stride, warm = Math.max(0, offset - stride);
+    const window = Buffer.from(result.subarray(warm, Math.min(result.length, offset + 3 * stride)));
+    const opts = { level: 5, memLevel: 7 };
+    if (warm) opts.dictionary = result.subarray(Math.max(0, warm - 32768), warm);
+    const current = result[offset];
+    let size = deflateRawSync(window, opts).length, selected = current;
+    for (let f = 0; f < 5; f++) {
+      if (f === current) continue;
+      streams[f].copy(window, offset - warm, offset, offset + stride);
+      const candidate = deflateRawSync(window, opts).length;
+      if (candidate + 2 < size) { selected = f; size = candidate; }
+    }
+    if (selected !== current) streams[selected].copy(result, offset, offset, offset + stride);
+  }
+  return result;
+}
+
 export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
@@ -396,15 +447,34 @@ export function encodeScreenshot(file) {
       }
     }
   }
+  let extraLayout;
+  if (bestSize <= 135000) {
+    const start = finalists[0];
+    const adjusted = polishBoundaryRows(start.raw, alternatives, width, height, image.channels);
+    if (!adjusted.equals(start.raw)) {
+      const bytes = refine(adjusted, image, raw => deflateSync(raw, { level: 9, memLevel: 9 }));
+      if (bytes + Math.max(4, start.bytes * 0.0002) < start.bytes) extraLayout = adjusted;
+    }
+  }
   let winner;
   for (const { raw } of finalists.filter(layout => layout.bytes <= bestSize * 1.02).slice(0, limit)) {
     const packed = compressOptimally(raw);
     if (packed && (!winner || packed.length < winner.packed.length)) winner = { raw, packed };
   }
   if (winner) {
-    const packed = repack(winner.raw, winner.packed, width * image.channels + 1);
-    const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
-    if (png.length < result.length) result = png;
+    const rowBytes = width * image.channels + 1;
+    const finish = (raw, compressed) => {
+      const packed = repack(raw, compressed, rowBytes);
+      const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
+      if (png.length < result.length) result = png;
+    };
+    finish(winner.raw, winner.packed);
+    // A smaller zlib preview can lose after optimal parsing and block splitting.
+    // Preserve the fully optimized incumbent and compare actual output bytes.
+    if (extraLayout && !extraLayout.equals(winner.raw)) {
+      const alternative = compressOptimally(extraLayout);
+      if (alternative && alternative.length < winner.packed.length) finish(extraLayout, alternative);
+    }
   }
   return result;
 }

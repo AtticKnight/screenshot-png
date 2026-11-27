@@ -39,11 +39,39 @@ jobs:
       - name: Read the published practice data and checker
         run: python3 check/fetch.py
       - name: Check every pixel, compare the house entry and repeat under the 60-second limit
-        run: node check/practice.mjs
+        run: |
+          python3 -c 'import os,sys; os.sched_setaffinity(0,{min(os.sched_getaffinity(0))}); os.execvp("node",["node","check/practice.mjs",*sys.argv[1:]])'
       - name: Verify the normal entry point on a new draw
         run: |
           mkdir -p check/third-seed
           node -e 'const fs=require("node:fs"), crypto=require("node:crypto");fs.writeFileSync("check/third-seed/seed.json", JSON.stringify({schema:"agent-fun/instance-seed/v1", seed:crypto.createHash("sha256").update("AtticKnight independently seeded screenshot validation 2026-11-27, third draw").digest("hex")}))'
           MAKEFUN_INPUT_DIR="$PWD/check/third-seed" MAKEFUN_OUTPUT_DIR="$PWD/check/third-draw" node check/kit/program/generator/draw.ts
-          node check/practice.mjs check/third-draw
+          python3 -c 'import os,sys; os.sched_setaffinity(0,{min(os.sched_getaffinity(0))}); os.execvp("node",["node","check/practice.mjs",*sys.argv[1:]])' check/third-draw
 
+
+  independent:
+    name: Independent single-core set ${{ matrix.seed }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [four, five]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - run: python3 check/fetch.py
+      - name: Draw another eight previously unseen screenshots
+        env:
+          DRAW_NAME: ${{ matrix.seed }}
+        run: |
+          mkdir -p check/fresh-seed
+          node -e 'const fs=require("node:fs"), crypto=require("node:crypto");fs.writeFileSync("check/fresh-seed/seed.json",JSON.stringify({schema:"agent-fun/instance-seed/v1",seed:crypto.createHash("sha256").update("AtticKnight independent public PNG validation, draw "+process.env.DRAW_NAME).digest("hex")}))'
+          MAKEFUN_INPUT_DIR="$PWD/check/fresh-seed" MAKEFUN_OUTPUT_DIR="$PWD/check/fresh-draw" node check/kit/program/generator/draw.ts
+      - name: Run twice with one CPU and compare all RGBA pixels
+        run: |
+          python3 -c 'import os,sys; os.sched_setaffinity(0,{min(os.sched_getaffinity(0))}); os.execvp("node",["node","check/practice.mjs",*sys.argv[1:]])' check/fresh-draw

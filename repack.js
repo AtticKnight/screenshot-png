@@ -422,7 +422,7 @@ function extendMatch(raw, runs, pos, dist, known, max) {
 // Reparse several native LZ77 factorizations under the starter stream's exact
 // Huffman prices. Every old match and literal remains available. Matches found
 // by another parser can be shortened or extended anywhere they overlap a cut.
-function reprice(raw, base, alternateStreams, prior, runs, depthLimit) {
+function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStarts) {
   const plans = [
     readPlan(base, raw.length, true),
     ...alternateStreams.map((x) => readPlan(x, raw.length, false)),
@@ -438,9 +438,17 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit) {
       if (end > 4) events[end - 4] = 1;
     }
   }
-  if (base.length < 85000) {
+  if (base.length < 85000 && extraStarts) {
+    // Spread a fixed number of extra starts across the input. Existing matches
+    // always remain eligible, even on unusually noisy screenshots.
+    const interval = Math.max(1, Math.ceil(raw.length / extraStarts));
+    let next = 1;
     for (let i = 1; i + 2 < raw.length; i++) {
-      if (raw[i - 1] !== raw[i] || runs[i] <= 3 || (i & 31) === 0) events[i] = 1;
+      if (i < next || events[i]) continue;
+      if (raw[i - 1] !== raw[i] || runs[i] <= 3 || (i & 31) === 0) {
+        events[i] = 1;
+        next = i + interval;
+      }
     }
   }
   const costs = new Int32Array(raw.length + 1),
@@ -457,6 +465,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit) {
   const bestLengths = new Uint16Array(259),
     bestCosts = new Int32Array(259),
     high = 1 << 28;
+  let probesLeft = 1500000;
   for (const block of blocks) {
     const { start, end, type, final, literal, distance } = block;
     if (type === 0) {
@@ -554,9 +563,10 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit) {
         let last = prior[at];
         for (
           let step = 0;
-          step < depthLimit && last >= 0 && at - last <= 32768;
+          step < depthLimit && probesLeft > 0 && last >= 0 && at - last <= 32768;
           step++, last = prior[last]
         ) {
+          probesLeft--;
           const dist = at - last,
             distanceSymbol = symbolForDistance[dist],
             distanceBits = distancePrices[distanceSymbol];
@@ -968,6 +978,9 @@ function tuneHeaders(raw, base) {
 export function repack(raw, packed) {
   // Compare alternate parses of this filtered image. The first pass keeps the
   // original block boundaries. The second uses the least expensive partition.
+  // Very dense streams already have many useful matches. Repartitioning their
+  // existing parse avoids a second expensive search over millions of samples.
+  if (packed.length > 255000) return tuneHeaders(raw, repartition(raw, packed, 320));
   const alternatives = [
     { level: 1, memLevel: 9 },
     { level: 5, memLevel: 8 },
@@ -978,11 +991,11 @@ export function repack(raw, packed) {
   for (let i = raw.length - 1; i >= 0; i--) {
     runs[i] = raw[i] === raw[i + 1] ? Math.min(258, runs[i + 1] + 1) : 1;
   }
-  const depth = packed.length > 180000 ? 48 : 96;
-  const first = reprice(raw, packed, alternatives, prior, runs, depth);
+  const depth = packed.length > 150000 ? 32 : 72;
+  const first = reprice(raw, packed, alternatives, prior, runs, depth, 50000);
   const grouped = repartition(raw, first, 240);
-  const final = packed.length > 180000
+  const final = packed.length > 150000
     ? grouped
-    : reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, depth);
+    : reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, 48, 16000);
   return tuneHeaders(raw, final);
 }

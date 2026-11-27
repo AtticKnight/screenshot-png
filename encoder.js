@@ -184,8 +184,7 @@ function filteredImages(image, width, height) {
   return streams;
 }
 
-function candidatesFor(image, w, h, effort) {
-  const streams = filteredImages(image, w, h);
+function candidatesFor(image, w, h, effort, streams) {
   const order = streams.map((raw, index) => ({
     index, bytes: deflateSync(raw, { level: 3, memLevel: 9 }).length,
   })).sort((a, b) => a.bytes - b.bytes);
@@ -229,9 +228,15 @@ function chooseStrips(streams, w, h, channels, stripHeight, history, level) {
 export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
-  const candidates = [];
+  let strongest, chosenStreams;
   function compare(image, effort = 3) {
-    candidates.push(...candidatesFor(image, width, height, effort));
+    const streams = filteredImages(image, width, height);
+    for (const candidate of candidatesFor(image, width, height, effort, streams)) {
+      if (!strongest || candidate.png.length < strongest.png.length) {
+        strongest = candidate;
+        chosenStreams = streams;
+      }
+    }
   }
   if (gray) compare(directImage(pixels, opaque ? 0 : 4), 4);
   if (indexed) {
@@ -244,8 +249,6 @@ export function encodeScreenshot(file) {
     if (frequent.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, frequent));
   }
   if (!gray) compare(directImage(pixels, opaque ? 2 : 6), 4);
-  candidates.sort((a,b) => a.png.length - b.png.length);
-  const strongest = candidates[0];
   let result = strongest.png;
   function refine(raw, image, compressor) {
     const packed = compressor(raw);
@@ -255,22 +258,19 @@ export function encodeScreenshot(file) {
     return png.length;
   }
   const image = strongest.image;
-  const alternatives = filteredImages(image, width, height);
+  const alternatives = chosenStreams;
   const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
   const narrow = chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3);
-  // The quick compressor selects two expensive refinements from the three
-  // independent layouts. It ranks complete rows, including their filter tags.
   const layouts = [strongest.raw, wide, narrow];
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
-  const ranked = distinct.map(raw => ({ raw, size: deflateSync(raw, {level:9}).length }))
-    .sort((a, b) => a.size - b.size);
-  // A quick zlib pass and a near-optimal parse can prefer different predictors.
-  // Select the input to the two-pass entropy model from measured libdeflate sizes.
-  let bestRaw = ranked[0].raw, bestSize = Infinity;
-  for (const candidate of ranked) {
-    const size = refine(candidate.raw, image, compressOptimally);
-    if (size < bestSize) { bestSize = size; bestRaw = candidate.raw; }
+  let bestRaw = distinct[0], bestSize = Infinity;
+  for (const raw of distinct) {
+    const size = refine(raw, image, compressOptimally);
+    if (size < bestSize) { bestSize = size; bestRaw = raw; }
   }
-  refine(bestRaw, image, compressWithZopfli);
+  // The entropy-model pass spends most of its time parsing the remaining tokens.
+  // On large residual streams use the already measured near-optimal parse.
+  // This fixed input-derived budget applies identically across all screenshots.
+  if (bestSize <= 128 * 1024) refine(bestRaw, image, compressWithZopfli);
   return result;
 }

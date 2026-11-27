@@ -11,6 +11,35 @@ function optimalLengths(freq, limit) {
     return result;
   }
   active.sort((a, b) => a.w - b.w || a.leaf - b.leaf);
+  // Ordinary Huffman coding is already optimal when its deepest leaf fits.
+  // Merge the sorted leaf and internal queues, then recover lengths in one
+  // reverse pass. Package-merge below handles the binding length limit.
+  const n = active.length;
+  const weights = new Float64Array(2 * n - 1);
+  const parents = new Int32Array(weights.length);
+  const depths = new Uint16Array(weights.length);
+  for (let i = 0; i < n; i++) weights[i] = active[i].w;
+  let leafIndex = 0, branchIndex = n, next = n;
+  function takeMinimum() {
+    if (leafIndex < n && (branchIndex === next || weights[leafIndex] <= weights[branchIndex])) {
+      return leafIndex++;
+    }
+    return branchIndex++;
+  }
+  for (; next < weights.length; next++) {
+    const left = takeMinimum(), right = takeMinimum();
+    weights[next] = weights[left] + weights[right];
+    parents[left] = parents[right] = next;
+  }
+  let deepest = 0;
+  for (let i = weights.length - 2; i >= 0; i--) {
+    depths[i] = depths[parents[i]] + 1;
+    if (i < n && depths[i] > deepest) deepest = depths[i];
+  }
+  if (deepest <= limit) {
+    for (let i = 0; i < n; i++) result[active[i].leaf] = depths[i];
+    return result;
+  }
   const take = 2 * active.length - 2;
   let list = active;
   for (let depth = 1; depth < limit; depth++) {

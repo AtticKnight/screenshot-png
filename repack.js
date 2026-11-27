@@ -1338,5 +1338,10 @@ export function repack(raw, packed, stride = 0) {
   const best = packed.length < 180000
     ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000, true)
     : grouped;
-  return tuneHeaders(raw, best);
+  const tuned = tuneHeaders(raw, best);
+  // The fractional parse changes token counts and the best places to switch
+  // Huffman tables. Reprice candidate boundaries on that final token sequence.
+  const finalGrain = tuned.length < 55000 ? 150 : 300;
+  const regrouped = repartition(raw, tuned, finalGrain);
+  return regrouped === tuned ? tuned : tuneHeaders(raw, regrouped);
 }

@@ -264,7 +264,7 @@ function polishStrips(base, sources, width, height, channels, rows) {
 // different endings survive each band, so an initially costlier predictor can
 // win once the next band uses its matches. Place cuts near changes in the
 // amount of vertical detail rather than tying them to a fixed scanline grid.
-function chooseFilterPath(streams, width, height, channels, guide) {
+function chooseFilterPath(streams, width, height, channels, guide, mediumDetail = false) {
   const stride = width * channels + 1;
   const detail = new Float64Array(height);
   const up = streams[2], plain = streams[0];
@@ -281,7 +281,7 @@ function chooseFilterPath(streams, width, height, channels, guide) {
     }
     detail[y] = (changed + 0.4 * edges) / Math.max(1, samples);
   }
-  const band = channels === 1 ? 11 : 9;
+  const band = mediumDetail ? 7 : channels === 1 ? 11 : 9;
   let paths = [{ score: 0, history: Buffer.alloc(0), previous: null, strip: null }];
   for (let y = 0; y < height;) {
     let stop = Math.min(height, y + band);
@@ -302,7 +302,7 @@ function chooseFilterPath(streams, width, height, channels, guide) {
     }
     const choices = [];
     for (const previous of paths) {
-      const options = { level: 5, memLevel: 7 };
+      const options = { level: mediumDetail ? 4 : 5, memLevel: 7 };
       if (previous.history.length) options.dictionary = previous.history;
       for (const strip of bands) {
         const bytes = deflateRawSync(strip, options).length;
@@ -375,6 +375,8 @@ export function encodeScreenshot(file) {
   }
   if (image.channels === 1 || strongest.png.length < width * height * 0.09) {
     layouts.push(chooseFilterPath(alternatives, width, height, image.channels, wide));
+  } else if (strongest.png.length < 190000) {
+    layouts.push(chooseFilterPath(alternatives, width, height, image.channels, narrow, true));
   }
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
   const ranked = distinct.map(raw => ({
@@ -382,7 +384,9 @@ export function encodeScreenshot(file) {
     bytes: refine(raw, image, data => deflateSync(data, { level: 9, memLevel: 9 })),
   })).sort((a, b) => a.bytes - b.bytes);
   const bestSize = ranked[0].bytes;
-  const limit = bestSize < 40000 && image.mode === 0 ? 2 : 1;
+  // The two compressors can rank close filter layouts differently.
+  // Limit the second full parse to compact images and nearby candidates.
+  const limit = bestSize < 110000 ? 2 : 1;
   const finalists = ranked.slice(0, limit);
   if (bestSize <= 175000) {
     const rows = image.mode === 0 || image.mode === 4 ? 5 : 8;
@@ -397,7 +401,7 @@ export function encodeScreenshot(file) {
     }
   }
   let winner;
-  for (const { raw } of finalists.filter(layout => layout.bytes <= bestSize * 1.02).slice(0, limit)) {
+  for (const { raw } of finalists.filter((layout, i) => i === 0 || layout.bytes <= bestSize * (image.mode === 0 ? 1.02 : 1.012)).slice(0, limit)) {
     const packed = compressOptimally(raw);
     if (packed && (!winner || packed.length < winner.packed.length)) winner = { raw, packed };
   }

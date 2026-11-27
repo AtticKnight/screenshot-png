@@ -1,6 +1,6 @@
 # Screenshot PNG
 
-A lossless encoder for 8-bit RGBA screenshots. It chooses among direct color, grayscale and palette representations. Fixed PNG filters, per-row predictors, and strips selected against previous rows compete on actual compressed size. A near-optimal libdeflate parse ranks the remaining layouts. Compact streams get another three to five Zopfli iterations, depending on their compressed size.
+A lossless encoder for 8-bit RGBA screenshots. It chooses among direct color, grayscale and palette representations. Fixed PNG filters, per-row predictors, and strips selected against previous rows compete on actual compressed size. A near-optimal libdeflate parse ranks the remaining layouts. Compact streams get another two or four Zopfli iterations, depending on their compressed size.
 
 Run `node main.ts` on Node.js 22.18 or later. The program reads one `image.png` per input subdirectory and writes a PNG of the same name and subdirectory to the output. The environment variables `MAKEFUN_INPUT_DIR` and `MAKEFUN_OUTPUT_DIR` default to `/input` and `/output`. It runs offline with the two checked-in compressors.
 

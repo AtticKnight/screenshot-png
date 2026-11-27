@@ -212,8 +212,11 @@ function chooseStrips(streams, w, h, channels, stripHeight, history, level) {
     const options = { level, memLevel: 7 };
     if (start) options.dictionary = selected.subarray(Math.max(0, start - history), start);
     let best = null, bestSize = Infinity;
+    const tried = [];
     for (const stream of streams) {
       const strip = stream.subarray(start, end);
+      if (tried.some(previous => previous.equals(strip))) continue;
+      tried.push(strip);
       const size = deflateRawSync(strip, options).length;
       if (size < bestSize) {
         best = strip;
@@ -239,7 +242,8 @@ export function encodeScreenshot(file) {
     }
   }
   if (gray) compare(directImage(pixels, opaque ? 0 : 4), 4);
-  if (indexed) {
+  // A dense gray ramp already has an ordered one-byte representation.
+  if (indexed && (!gray || counts.size < 96)) {
     const colors = Array.from(counts.keys());
     compare(paletteImage(pixels, colors));
     const luma = c => (c & 255) * 3 + ((c >>> 8) & 255) * 6 + ((c >>> 16) & 255);
@@ -248,7 +252,8 @@ export function encodeScreenshot(file) {
     const frequent = colors.slice().sort((a, b) => counts.get(b) - counts.get(a) || a - b);
     if (frequent.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, frequent));
   }
-  if (!gray) compare(directImage(pixels, opaque ? 2 : 6), 4);
+  // Small opaque flat palettes avoid repeating a full three-channel filter search.
+  if (!gray && (!indexed || !opaque || counts.size > 64)) compare(directImage(pixels, opaque ? 2 : 6), 4);
   let result = strongest.png;
   function refine(raw, image, compressor) {
     const packed = compressor(raw);
@@ -271,6 +276,6 @@ export function encodeScreenshot(file) {
   // The entropy-model pass spends most of its time parsing the remaining tokens.
   // On large residual streams use the already measured near-optimal parse.
   // This fixed input-derived budget applies identically across all screenshots.
-  if (bestSize <= 128 * 1024) refine(bestRaw, image, raw => compressWithZopfli(raw, bestSize < 49152 ? 5 : 3));
+  if (bestSize <= 128 * 1024) refine(bestRaw, image, raw => compressWithZopfli(raw, bestSize < 49152 ? 4 : 2));
   return result;
 }

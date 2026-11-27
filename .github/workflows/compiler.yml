@@ -1,0 +1,52 @@
+name: Build and check the JavaScript compressor
+on:
+  push:
+    branches: [compressor-experiment]
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ebiggers/libdeflate
+          ref: 96836d7d9d10e3e0d53e6edb54eb908514e336c4
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - name: Compile the JavaScript source and verify a zlib round trip
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends binaryen lld-18 clang-18
+          TMPDIR="$RUNNER_TEMP" sh build/compile.sh upstream
+          wc -c vendor/libdeflate.js
+          sha256sum vendor/libdeflate.js
+          node --input-type=module - <<'JS'
+          import assert from 'node:assert/strict';
+          import { inflateSync } from 'node:zlib';
+          import { compressOptimally } from './optimal.js';
+          for (const sample of [Buffer.alloc(900000),Buffer.from('alpha beta gamma alpha beta theta '.repeat(10000))]) {
+            const compressed = compressOptimally(sample);
+            assert.ok(compressed && compressed.length < sample.length / 100);
+            assert.deepEqual(inflateSync(compressed),sample);
+            console.log('Round trip',sample.length,compressed.length);
+          }
+          JS
+      - name: Save the generated JavaScript and its upstream licence
+        uses: actions/upload-artifact@v4
+        with:
+          name: libdeflate-javascript
+          path: |
+            vendor/libdeflate.js
+            vendor/COPYING
+      - name: Read the public practice set
+        run: python3 check/fetch.py
+      - name: Check pixels, size, speed and deterministic output twice
+        run: node check/practice.mjs

@@ -1,5 +1,7 @@
 import { crc32, deflateSync, inflateSync } from 'node:zlib';
 
+import { compressOptimally } from './optimal.js';
+
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
 function paeth(left, above, corner) {
@@ -191,10 +193,13 @@ function bestCompression(image, w, h, effort) {
   if (image.mode === 6 || image.mode === 2) candidates.add(4);
   let best;
   for (const i of candidates) {
-    const result = deflateSync(streams[i], { level: 9, memLevel: 9 });
-    if (!best || result.length < best.length) best = result;
+    for (const memLevel of [8, 9]) {
+      const packed = deflateSync(streams[i], { level: 9, memLevel });
+      if (!best || packed.length < best.packed.length) best = { packed, raw: streams[i] };
+    }
   }
-  return assemble(w, h, image.mode, best, image.palette, image.transparency);
+  const bytes = assemble(w, h, image.mode, best.packed, image.palette, image.transparency);
+  return { bytes, raw: best.raw, mode: image.mode, palette: image.palette, transparency: image.transparency };
 }
 
 export function encodeScreenshot(file) {
@@ -202,8 +207,8 @@ export function encodeScreenshot(file) {
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
   let smallest;
   function compare(image, effort = 3) {
-    const bytes = bestCompression(image, width, height, effort);
-    if (!smallest || bytes.length < smallest.length) smallest = bytes;
+    const candidate = bestCompression(image, width, height, effort);
+    if (!smallest || candidate.bytes.length < smallest.bytes.length) smallest = candidate;
   }
   if (gray) compare(directImage(pixels, opaque ? 0 : 4), 4);
   if (indexed) {
@@ -216,5 +221,8 @@ export function encodeScreenshot(file) {
     if (frequent.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, frequent));
   }
   if (!gray) compare(directImage(pixels, opaque ? 2 : 6), 4);
-  return smallest;
+  const packed = compressOptimally(smallest.raw);
+  if (!packed) return smallest.bytes;
+  const candidate = assemble(width, height, smallest.mode, packed, smallest.palette, smallest.transparency);
+  return candidate.length < smallest.bytes.length ? candidate : smallest.bytes;
 }

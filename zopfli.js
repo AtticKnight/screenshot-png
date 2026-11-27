@@ -6,7 +6,7 @@ export function compressWithZopfli(input) {
   if (!start) return undefined;
   try {
     engine.HEAPU8.set(input, start);
-    const size = engine._compress_zlib(start,input.length,1);
+    const size = engine._compress_zlib(start,input.length,2);
     if (!size) return undefined;
     const result = engine._result_pointer();
     return Buffer.from(engine.HEAPU8.subarray(result,result+size));

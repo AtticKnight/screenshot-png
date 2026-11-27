@@ -18,16 +18,23 @@ jobs:
           ref: bd64b2f0553d4f1ef4e6627647c5d9fc8c71ffc0
           path: zopfli-source
           persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ebiggers/libdeflate
+          ref: 96836d7d9d10e3e0d53e6edb54eb908514e336c4
+          path: libdeflate-source
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '22.18.0'
       - name: Build pinned Zopfli and check the zlib stream
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends emscripten
+          sudo apt-get install -y --no-install-recommends emscripten clang-18 lld-18
+          sh build/native-lib.sh libdeflate-source
           sh build/zopfli.sh zopfli-source
-          wc -c vendor/zopfli.cjs
-          sha256sum vendor/zopfli.cjs
+          wc -c vendor/zopfli.cjs vendor/libdeflate.wasm
+          sha256sum vendor/zopfli.cjs vendor/libdeflate.wasm
           node --input-type=module - <<'JS'
           import assert from 'node:assert/strict';
           import { inflateSync } from 'node:zlib';
@@ -43,7 +50,9 @@ jobs:
           path: |
             vendor/zopfli.cjs
             vendor/ZOPFLI-LICENSE
+            vendor/libdeflate.wasm
+            vendor/COPYING
       - name: Download the published practice set
         run: python3 check/fetch.py
-      - name: Measure a single compression pass on all eight screenshots
+      - name: Compare bounded Zopfli and native libdeflate on all eight screenshots
         run: node check/zopfli-practice.mjs

@@ -1,4 +1,5 @@
 import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
+import { compressOptimally } from './optimal.js';
 
 
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -275,15 +276,12 @@ export function encodeScreenshot(file) {
     layouts.push(chooseStrips(alternatives, width, height, image.channels, rows, 32768, level));
   }
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
-  let bestRaw = distinct[0], bestSize = Infinity;
-  for (const raw of distinct) {
-    const size = refine(raw, image, data => deflateSync(data, { level: 9, memLevel: 9 }));
-    if (size < bestSize) { bestSize = size; bestRaw = raw; }
-  }
-  // zlib's block boundaries depend on its token buffer. Different limits
-  // trade header overhead against how closely codes follow the current rows.
-  for (const memLevel of [6, 8]) {
-    refine(bestRaw, image, data => deflateSync(data, { level: 9, memLevel }));
-  }
+  const ranked = distinct.map(raw => ({
+    raw,
+    bytes: refine(raw, image, data => deflateSync(data, { level: 9, memLevel: 9 })),
+  })).sort((a, b) => a.bytes - b.bytes);
+  // The first pass compares layout sizes cheaply. A near-optimal DEFLATE
+  // parse on the two shortest gives each a chance with a richer cost model.
+  for (const { raw } of ranked.slice(0, 2)) refine(raw, image, compressOptimally);
   return result;
 }

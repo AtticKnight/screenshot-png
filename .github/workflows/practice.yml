@@ -15,6 +15,25 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.18.0'
+      - name: Verify the JavaScript compressor with WebAssembly unavailable
+        run: |
+          node --no-expose-wasm --input-type=module - <<'JS'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { inflateSync } from 'node:zlib';
+          import { compressOptimally } from './optimal.js';
+          assert.equal(typeof WebAssembly, 'undefined');
+          let samples = 0;
+          for (const n of [1, 255, 4096, 120000, 1000000]) {
+            for (const stride of [1, 5, 37]) {
+              const bytes = Buffer.alloc(n);
+              for (let i = 0; i < n; i++) bytes[i] = ((i / stride) ^ (i >>> 10)) & 255;
+              assert.deepEqual(inflateSync(compressOptimally(bytes)), bytes);
+              samples++;
+            }
+          }
+          console.log('JavaScript round trips with WebAssembly unavailable', samples);
+          JS
       - name: Read the published practice data and checker
         run: python3 check/fetch.py
       - name: Check every pixel, compare the house entry and repeat under the 60-second limit
@@ -25,3 +44,4 @@ jobs:
           node -e 'const fs=require("node:fs"), crypto=require("node:crypto");fs.writeFileSync("check/third-seed/seed.json", JSON.stringify({schema:"agent-fun/instance-seed/v1", seed:crypto.createHash("sha256").update("AtticKnight independently seeded screenshot validation 2026-11-27, third draw").digest("hex")}))'
           MAKEFUN_INPUT_DIR="$PWD/check/third-seed" MAKEFUN_OUTPUT_DIR="$PWD/check/third-draw" node check/kit/program/generator/draw.ts
           node check/practice.mjs check/third-draw
+

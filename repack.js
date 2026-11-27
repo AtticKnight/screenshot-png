@@ -193,17 +193,27 @@ function chooseCodebook(raw, start, end, lengthPath, distancePath, block) {
 }
 // Index earlier triples in descending position order. The chain search compares
 // bytes before accepting a match, including on hash collisions.
-function priorOccurrences(raw) {
-  const heads = new Int32Array(131072),
-    prior = new Int32Array(raw.length);
-  heads.fill(-1);
-  prior.fill(-1);
+function priorOccurrences(raw, runs, stride) {
+  const shortHeads = new Int32Array(131072), longHeads = new Int32Array(131072);
+  const short = new Int32Array(raw.length), long = new Int32Array(raw.length);
+  shortHeads.fill(-1); longHeads.fill(-1);
+  short.fill(-1); long.fill(-1);
   for (let i = 0; i + 2 < raw.length; i++) {
-    const k = Math.imul(raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16), -1640531527) >>> 15;
-    prior[i] = heads[k];
-    heads[k] = i;
+    // The second index distinguishes repeated prefixes by their following bytes or run boundary.
+    const leading = raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16);
+    const key = Math.imul(leading, -1640531527) >>> 15;
+    short[i] = shortHeads[key]; shortHeads[key] = i;
+    if (i + 13 < raw.length) {
+      const span = runs[i], edge = i + span;
+      const following = span >= 4 && span < 258 && edge + 3 < raw.length
+        ? span | (raw[edge] << 8) | (raw[edge + 1] << 16) | (raw[edge + 3] << 24)
+        : raw[i + 4] | (raw[i + 7] << 8) | (raw[i + 13] << 16);
+      const longer = (Math.imul(leading, -1640531527) ^ Math.imul(following, 16777619)) >>> 15;
+      long[i] = longHeads[longer]; longHeads[longer] = i;
+    }
   }
-  return prior;
+  const rows = stride > 0 ? [1, 2, 3, 4, 6, 8, 12, 16, 24].map(n => n * stride).filter(d => d <= 32768) : [];
+  return { short, long, rows };
 }
 
 const lengthBase = [
@@ -438,7 +448,11 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
       if (end > 4) events[end - 4] = 1;
     }
   }
-  if (base.length < 85000 && extraStarts) {
+  if (base.length < 85000 && raw.length <= 1400000 && extraStarts) {
+    for (let i = 1; i + 2 < raw.length; i++) {
+      if (raw[i - 1] !== raw[i] || runs[i] <= 3 || (i & 31) === 0) events[i] = 1;
+    }
+  } else if (base.length < 185000 && extraStarts) {
     // Spread a fixed number of extra starts across the input. Existing matches
     // always remain eligible, even on unusually noisy screenshots.
     const interval = Math.max(1, Math.ceil(raw.length / extraStarts));
@@ -458,16 +472,18 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
     reader = new BitReader(base.subarray(2, -4));
   const streamEnds = plans.map(() => 0),
     cursors = new Int32Array(plans.length);
-  const capacity = plans.length + depthLimit + 1;
+  const capacity = plans.length + depthLimit + 13 + prior.rows.length;
   const candidates = new Uint16Array(capacity),
     reach = new Uint16Array(capacity),
     prices = new Uint16Array(capacity);
   const bestLengths = new Uint16Array(259),
     bestCosts = new Int32Array(259),
     high = 1 << 28;
-  let probesLeft = 850000;
+  const probeBudget = raw.length > 1400000 ? 5000000 : 7200000;
+  let probesLeft = 0;
   for (const block of blocks) {
     const { start, end, type, final, literal, distance } = block;
+    probesLeft += Math.ceil(probeBudget * (end - start) / raw.length);
     if (type === 0) {
       writeStored(writer, raw, start, end, final);
       continue;
@@ -496,26 +512,41 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
       cursors[s] = idx - 1;
     }
     costs[end] = 0;
-    const minima = Array.from({ length: 6 }, () => new Int32Array(512));
-    // Record the cheapest suffix in the next 1, 2, 4, 8, 16 and 32 bytes. A
-    // DEFLATE length symbol never covers a wider interval than 32 lengths.
+    const suffixMinimum = new Int32Array(512), prefixMinimum = new Int32Array(512);
     function remember(pos) {
-      let selected = pos;
       const slot = pos & 511;
-      minima[0][slot] = pos;
-      for (let level = 1, half = 1; level < 6; level++, half <<= 1) {
-        if (pos + half <= end) {
-          const other = minima[level - 1][(pos + half) & 511];
-          if (costs[other] < costs[selected]) selected = other;
+      let best = pos;
+      if (pos < end && (pos & 7) !== 7) {
+        const next = suffixMinimum[(pos + 1) & 511];
+        if (costs[next] < costs[best]) best = next;
+      }
+      suffixMinimum[slot] = best;
+      if ((pos & 7) === 0) {
+        best = pos;
+        const stop = Math.min(end, pos + 7);
+        for (let i = pos; i <= stop; i++) {
+          if (costs[i] < costs[best]) best = i;
+          prefixMinimum[i & 511] = best;
         }
-        minima[level][slot] = selected;
       }
     }
     function minimumPosition(left, right) {
-      const level = 31 - Math.clz32(right - left + 1);
-      const a = minima[level][left & 511];
-      const b = minima[level][(right - (1 << level) + 1) & 511];
-      return costs[a] <= costs[b] ? a : b;
+      if (left === right) return left;
+      const lower = left & ~7, upper = right & ~7;
+      if (lower === upper) {
+        if (left === lower) return prefixMinimum[right & 511];
+        if ((right & 7) === 7) return suffixMinimum[left & 511];
+        let best = left;
+        for (let p = left + 1; p <= right; p++) if (costs[p] < costs[best]) best = p;
+        return best;
+      }
+      let best = suffixMinimum[left & 511];
+      for (let p = lower + 8; p < upper; p += 8) {
+        const other = suffixMinimum[p & 511];
+        if (costs[other] < costs[best]) best = other;
+      }
+      const tail = prefixMinimum[right & 511];
+      return costs[tail] < costs[best] ? tail : best;
     }
     const prefixCosts = new Int32Array(29), prefixLengths = new Uint16Array(29);
     remember(end);
@@ -560,17 +591,41 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
         let fullCost = 255;
         for (let j = 0; j < count; j++)
           if (reach[j] === limit) fullCost = Math.min(fullCost, prices[j]);
-        let last = prior[at];
-        for (
-          let step = 0;
-          step < depthLimit && probesLeft > 0 && last >= 0 && at - last <= 32768;
-          step++, last = prior[last]
-        ) {
+        // Aligned scanlines can be farther back than the nearest hash-chain entries.
+        for (const dist of prior.rows) {
+          if (dist > at) break;
+          const price = distancePrices[symbolForDistance[dist]] + distanceExtra[symbolForDistance[dist]];
+          if (fullCost <= price) continue;
+          const from = at - dist;
+          if (raw[from] !== raw[at] || raw[from + 1] !== raw[at + 1] || raw[from + 2] !== raw[at + 2]) continue;
+          let need = 2;
+          for (let j = 0; j < count; j++) {
+            if (candidates[j] === dist) { need = limit; break; }
+            if (prices[j] <= price && reach[j] > need) need = reach[j];
+          }
+          if (need >= limit || raw[from + need] !== raw[at + need]) continue;
+          const len = extendMatch(raw, runs, at, dist, 3, limit);
+          if (len <= need) continue;
+          candidates[count] = dist; reach[count] = len; prices[count++] = price;
+          max = Math.max(max, len);
+          if (len === limit) fullCost = Math.min(fullCost, price);
+        }
+        let chain = prior.long, last = chain[at];
+        const longLimit = 12;
+        for (let step = 0; step < depthLimit + longLimit && probesLeft > 0; step++, last = chain[last]) {
+          if (step === longLimit) { chain = prior.short; last = chain[at]; }
+          if (last < 0 || at - last > 32768) {
+            if (step < longLimit) { step = longLimit - 1; continue; }
+            break;
+          }
           probesLeft--;
           const dist = at - last,
             distanceSymbol = symbolForDistance[dist],
             distanceBits = distancePrices[distanceSymbol];
-          if (fullCost <= minDistanceCost[distanceSymbol]) break;
+          if (fullCost <= minDistanceCost[distanceSymbol]) {
+            if (step < longLimit) { step = longLimit - 1; continue; }
+            break;
+          }
           if (!distanceBits) continue;
           const distancePrice = distanceBits + distanceExtra[distanceSymbol];
           let minimumLength = 2,
@@ -975,27 +1030,24 @@ function tuneHeaders(raw, base) {
   return result.length < base.length ? result : base;
 }
 
-export function repack(raw, packed) {
-  // Repricing stores a suffix cost at each input byte. Direct-colour layouts can
-  // contain four times as many bytes as a palette image, even at the same PNG size.
-  // Use token-level optimization for those layouts and reserve the full search
-  // for compact colour planes. Both budgets depend only on the input.
-  if (packed.length > 240000) return tuneHeaders(raw, packed);
-  if (packed.length > 115000 || (raw.length > 1400000 && packed.length > 55000)) {
-    return tuneHeaders(raw, repartition(raw, packed, 460));
-  }
+export function repack(raw, packed, stride = 0) {
+  if (packed.length > 245000) return tuneHeaders(raw, packed);
+  if (packed.length > 175000) return tuneHeaders(raw, repartition(raw, packed, 460));
   const alternatives = [
-    deflateSync(raw, { level: 2, memLevel: 9 }),
-    deflateSync(raw, { level: 8, memLevel: 8 }),
+    deflateSync(raw, { level: 1, memLevel: 9 }),
+    deflateSync(raw, { level: 5, memLevel: 8 }),
+    deflateSync(raw, { level: 9, memLevel: 9 }),
   ];
-  const prior = priorOccurrences(raw);
   const runs = new Uint16Array(raw.length);
   for (let i = raw.length - 1; i >= 0; i--) {
     runs[i] = raw[i] === raw[i + 1] ? Math.min(258, runs[i + 1] + 1) : 1;
   }
-  const first = raw.length > 1400000
-    ? reprice(raw, packed, alternatives, prior, runs, 24, 12000)
-    : reprice(raw, packed, alternatives, prior, runs, 48, 32000);
-  const grouped = repartition(raw, first, 280);
-  return tuneHeaders(raw, grouped);
+  const prior = priorOccurrences(raw, runs, stride);
+  const large = raw.length > 1400000;
+  const first = reprice(raw, packed, alternatives, prior, runs, large ? 52 : 80, large ? 65000 : 125000);
+  const grouped = repartition(raw, first, packed.length < 180000 ? 240 : 380);
+  const best = packed.length < 180000
+    ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000)
+    : grouped;
+  return tuneHeaders(raw, best);
 }

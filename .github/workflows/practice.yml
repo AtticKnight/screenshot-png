@@ -1,7 +1,7 @@
 name: Verify screenshot compression
 on:
   push:
-    branches: [verify]
+    branches: [bench-screen-row-match-index]
 permissions:
   contents: read
 jobs:
@@ -56,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed: [four, five]
+        seed: [four, five, six]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:

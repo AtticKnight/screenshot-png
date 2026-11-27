@@ -1,7 +1,7 @@
 name: Verify screenshot compression
 on:
   push:
-    branches: [bench-png-run-length-book-prices]
+    branches: [bench-png-palette-residual-aliases]
 permissions:
   contents: read
 jobs:

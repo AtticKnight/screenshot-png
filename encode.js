@@ -1,0 +1,420 @@
+import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
+import { compressOptimally } from './optimal.js';
+import { repack } from './repack.js';
+
+
+const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+
+function paeth(left, above, corner) {
+  const da = Math.abs(above - corner);
+  const db = Math.abs(left - corner);
+  const dc = Math.abs(left + above - 2 * corner);
+  return da <= db && da <= dc ? left : db <= dc ? above : corner;
+}
+
+export function decodeRgba(file) {
+  if (!file.subarray(0, 8).equals(signature)) throw new Error('Expected a PNG.');
+  const width = file.readUInt32BE(16);
+  const height = file.readUInt32BE(20);
+  if (file[24] !== 8 || file[25] !== 6 || file[28] !== 0) {
+    throw new Error('Expected a noninterlaced 8-bit RGBA source.');
+  }
+  const data = [];
+  for (let at = 8; at + 12 <= file.length;) {
+    const size = file.readUInt32BE(at);
+    if (at + 12 + size > file.length) throw new Error('Incomplete PNG chunk.');
+    const type = file.toString('ascii', at + 4, at + 8);
+    if (type === 'IDAT') data.push(file.subarray(at + 8, at + 8 + size));
+    at += 12 + size;
+    if (type === 'IEND') break;
+  }
+  const stride = width * 4;
+  const raw = inflateSync(Buffer.concat(data), { maxOutputLength: (stride + 1) * height });
+  if (raw.length !== (stride + 1) * height) throw new Error('Incorrect image size.');
+  const pixels = Buffer.allocUnsafe(stride * height);
+  for (let y = 0; y < height; y++) {
+    const row = y * stride;
+    const from = row + y;
+    const mode = raw[from];
+    if (mode === 0) {
+      raw.copy(pixels, row, from + 1, from + 1 + stride);
+      continue;
+    }
+    if (mode > 4) throw new Error('Unknown row filter.');
+    for (let x = 0; x < stride; x++) {
+      const pos = row + x;
+      const left = x >= 4 ? pixels[pos - 4] : 0;
+      const up = y ? pixels[pos - stride] : 0;
+      const corner = y && x >= 4 ? pixels[pos - stride - 4] : 0;
+      const prediction = mode === 1 ? left : mode === 2 ? up : mode === 3 ? (left + up) >> 1 : paeth(left, up, corner);
+      pixels[pos] = raw[from + 1 + x] + prediction;
+    }
+  }
+  return { width, height, pixels };
+}
+
+function chunk(name, data) {
+  const out = Buffer.allocUnsafe(12 + data.length);
+  out.writeUInt32BE(data.length, 0);
+  out.write(name, 4, 4, 'ascii');
+  data.copy(out, 8);
+  out.writeUInt32BE(crc32(out.subarray(4, 8 + data.length)), 8 + data.length);
+  return out;
+}
+
+function assemble(w, h, mode, stream, palette, transparency) {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(w, 0);
+  header.writeUInt32BE(h, 4);
+  header[8] = 8;
+  header[9] = mode;
+  const parts = [signature, chunk('IHDR', header)];
+  if (palette) parts.push(chunk('PLTE', palette));
+  if (transparency?.length) parts.push(chunk('tRNS', transparency));
+  parts.push(chunk('IDAT', stream), chunk('IEND', Buffer.alloc(0)));
+  return Buffer.concat(parts);
+}
+
+function inspectColors(pixels) {
+  const counts = new Map();
+  let indexed = true;
+  let gray = true;
+  let opaque = true;
+  for (let i = 0; i < pixels.length; i += 4) {
+    if (pixels[i] !== pixels[i + 1] || pixels[i] !== pixels[i + 2]) gray = false;
+    if (pixels[i + 3] !== 255) opaque = false;
+    if (indexed) {
+      const color = pixels.readUInt32LE(i);
+      counts.set(color, (counts.get(color) ?? 0) + 1);
+      if (counts.size > 256) indexed = false;
+    }
+    if (!indexed && !gray && !opaque) break;
+  }
+  return { counts, indexed, gray, opaque };
+}
+
+function paletteImage(pixels, colors) {
+  const byColor = new Map();
+  const table = Buffer.allocUnsafe(colors.length * 3);
+  const alphas = Buffer.allocUnsafe(colors.length);
+  let alphaLength = 0;
+  for (let i = 0; i < colors.length; i++) {
+    const color = colors[i];
+    byColor.set(color, i);
+    table[3 * i] = color;
+    table[3 * i + 1] = color >>> 8;
+    table[3 * i + 2] = color >>> 16;
+    alphas[i] = color >>> 24;
+    if (alphas[i] !== 255) alphaLength = i + 1;
+  }
+  const data = Buffer.allocUnsafe(pixels.length / 4);
+  for (let p = 0; p < data.length; p++) data[p] = byColor.get(pixels.readUInt32LE(4 * p));
+  return { data, mode: 3, channels: 1, palette: table, transparency: alphas.subarray(0, alphaLength) };
+}
+
+function directImage(pixels, mode) {
+  if (mode === 6) return { data: pixels, mode, channels: 4 };
+  const channels = mode === 0 ? 1 : mode === 4 ? 2 : 3;
+  const data = Buffer.allocUnsafe(pixels.length / 4 * channels);
+  for (let i = 0, j = 0; i < pixels.length; i += 4) {
+    data[j++] = pixels[i];
+    if (mode === 2) {
+      data[j++] = pixels[i + 1];
+      data[j++] = pixels[i + 2];
+    } else if (mode === 4) {
+      data[j++] = pixels[i + 3];
+    }
+  }
+  return { data, mode, channels };
+}
+
+const magnitude = Uint8Array.from({ length: 256 }, (_, x) => Math.min(x, 256 - x));
+const tokenCost = Uint8Array.from(magnitude, x => x === 0 ? 0 : 2 + Math.floor(Math.log2(x)));
+
+// Compare whole-image filters with row-wise predictors. A row of constant residuals
+// compresses well even when the byte is large, so our second estimator discounts runs.
+function filteredImages(image, width, height) {
+  const { data, channels } = image;
+  const stride = width * channels;
+  const outputStride = stride + 1;
+  const streams = Array.from({ length: 7 }, () => Buffer.allocUnsafe(outputStride * height));
+  const [plain, sub, up, avg, paethStream, byMagnitude, byRuns] = streams;
+  const sums = new Float64Array(5);
+  const runs = new Float64Array(5);
+  for (let y = 0; y < height; y++) {
+    const dst = y * outputStride;
+    const src = y * stride;
+    for (let f = 0; f < 5; ++f) streams[f][dst] = f;
+    for (let x = 0; x < stride; x++) {
+      const pos = src + x;
+      const byte = data[pos];
+      const left = x >= channels ? data[pos - channels] : 0;
+      const above = y ? data[pos - stride] : 0;
+      const corner = y && x >= channels ? data[pos - stride - channels] : 0;
+      const p = dst + x + 1;
+      plain[p] = byte;
+      sub[p] = byte - left;
+      up[p] = byte - above;
+      avg[p] = byte - ((left + above) >> 1);
+      paethStream[p] = byte - paeth(left, above, corner);
+    }
+    // Sample every channel on alternate pixels. The phase changes on each row.
+    for (let f = 0; f < 5; f++) {
+      const stream = streams[f];
+      let magnitudeTotal = 0, symbolTotal = 0, last = -1;
+      for (let x = (y & 1) * channels; x < stride; x += 2 * channels) {
+        for (let c = 0; c < channels; c++) {
+          const b = stream[dst + x + c + 1];
+          magnitudeTotal += magnitude[b];
+          if (last !== b) symbolTotal += 4 + tokenCost[b];
+          last = b;
+        }
+      }
+      sums[f] = magnitudeTotal;
+      runs[f] = symbolTotal;
+    }
+    let a = 0, b = 0;
+    for (let f = 1; f < 5; f++) {
+      if (sums[f] < sums[a]) a = f;
+      if (runs[f] < runs[b]) b = f;
+    }
+    streams[a].copy(byMagnitude, dst, dst, dst + outputStride);
+    streams[b].copy(byRuns, dst, dst, dst + outputStride);
+  }
+  return streams;
+}
+
+function candidatesFor(image, w, h, effort, streams) {
+  const order = streams.map((raw, index) => ({
+    index, bytes: deflateSync(raw, { level: 3, memLevel: 9 }).length,
+  })).sort((a, b) => a.bytes - b.bytes);
+  const indices = new Set(order.slice(0, effort).map(candidate => candidate.index));
+  if (image.mode === 2 || image.mode === 6) indices.add(4);
+  const candidates = [];
+  for (const index of indices) {
+    const raw = streams[index];
+    const packed = deflateSync(raw, { level: 9, memLevel: 8 });
+    const png = assemble(w, h, image.mode, packed, image.palette, image.transparency);
+    candidates.push({ png, raw, image, index });
+  }
+  return candidates;
+}
+
+// Compare complete strips against the same prefix dictionary. Fixed Paeth, for
+// example, can work well across a soft shadow and poorly in a table of flat fills.
+// Previous choices become the dictionary for the next group of rows.
+function chooseStrips(streams, w, h, channels, stripHeight, history, level) {
+  const stride = w * channels + 1;
+  const selected = Buffer.allocUnsafe(stride * h);
+  for (let y = 0; y < h; y += stripHeight) {
+    const start = y * stride;
+    const end = Math.min(h, y + stripHeight) * stride;
+    const options = { level, memLevel: 7 };
+    if (start) options.dictionary = selected.subarray(Math.max(0, start - history), start);
+    let best = null, bestSize = Infinity;
+    const tried = [];
+    for (const stream of streams) {
+      const strip = stream.subarray(start, end);
+      if (tried.some(previous => previous.equals(strip))) continue;
+      tried.push(strip);
+      const size = deflateRawSync(strip, options).length;
+      if (size < bestSize) {
+        best = strip;
+        bestSize = size;
+      }
+    }
+    best.copy(selected, start);
+  }
+  return selected;
+}
+
+// Change a band only when its neighboring rows still compress well across both
+// edges. Keeping the rest of a strong layout fixed preserves long-distance matches.
+function polishStrips(base, sources, width, height, channels, rows) {
+  const stride = width * channels + 1;
+  const result = Buffer.from(base);
+  for (let y = 0; y < height; y += rows) {
+    const start = y * stride, end = Math.min(height, y + rows) * stride;
+    const warmStart = Math.max(0, start - 2 * stride);
+    const left = result.subarray(warmStart, start);
+    const right = base.subarray(end, Math.min(base.length, end + 3 * stride));
+    const options = { level: 6, memLevel: 8 };
+    if (warmStart) options.dictionary = result.subarray(Math.max(0, warmStart - 32768), warmStart);
+    const size = (strip) => deflateRawSync(Buffer.concat([left, strip, right]), options).length;
+    const original = base.subarray(start, end);
+    const originalSize = size(original);
+    const seen = [original];
+    let best = original, bestSize = originalSize;
+    for (const source of sources) {
+      const strip = source.subarray(start, end);
+      if (seen.some((previous) => previous.equals(strip))) continue;
+      seen.push(strip);
+      const bytes = size(strip);
+      if (bytes < bestSize) {
+        best = strip;
+        bestSize = bytes;
+      }
+    }
+    if (bestSize + 12 < originalSize) best.copy(result, start);
+  }
+  return result;
+}
+
+// Repeating a small palette lets the same color use several legal indices.
+// For a fixed row predictor, choose the index with the smallest signed residual.
+// The decoder reconstructs the selected indices and every copy maps to the
+// exact same RGBA value. Trim both palette chunks to the entries actually used.
+function residualPalette(image, width, height, filter, copies) {
+  const colors = image.palette.length / 3;
+  const period = 2 ** Math.ceil(Math.log2(colors));
+  const extent = Math.min(period * copies, 256);
+  if (extent <= period) return null;
+  const highestCopy = extent / period - 1;
+  const data = Buffer.allocUnsafe(width * height);
+  const raw = Buffer.allocUnsafe((width + 1) * height);
+  let high = 0;
+  for (let y = 0; y < height; y++) {
+    let from = y * width, at = y * (width + 1);
+    raw[at++] = filter;
+    for (let x = 0; x < width; x++, from++, at++) {
+      const left = x === 0 ? 0 : data[from - 1];
+      const above = y === 0 ? 0 : data[from - width];
+      const corner = x && y ? data[from - width - 1] : 0;
+      const predict = filter === 1 ? left : filter === 2 ? above :
+        filter === 3 ? (left + above) >>> 1 : paeth(left, above, corner);
+      const rank = image.data[from];
+      let index;
+      if (extent === 256) {
+        const half = period >>> 1;
+        const delta = ((rank - predict + half) & (period - 1)) - half;
+        index = (predict + delta) & 255;
+      } else {
+        const k = Math.min(highestCopy, Math.max(0, Math.round((predict - rank) / period)));
+        index = rank + period * k;
+      }
+      data[from] = index;
+      raw[at] = index - predict;
+      if (index > high) high = index;
+    }
+  }
+  const palette = Buffer.alloc((high + 1) * 3), alpha = Buffer.alloc(high + 1, 255);
+  let lastAlpha = 0;
+  for (let i = 0; i <= high; i++) {
+    const q = i & (period - 1), base = q < colors ? q : 0;
+    image.palette.copy(palette, i * 3, base * 3, base * 3 + 3);
+    if (base < image.transparency.length && image.transparency[base] !== 255) {
+      alpha[i] = image.transparency[base];
+      lastAlpha = i + 1;
+    }
+  }
+  const remapped = { mode: 3, channels: 1, palette, transparency: alpha.subarray(0, lastAlpha) };
+  return { raw, image: remapped };
+}
+
+export function encodeScreenshot(file) {
+  const { width, height, pixels } = decodeRgba(file);
+  const { counts, indexed, gray, opaque } = inspectColors(pixels);
+  let strongest, chosenStreams;
+  function compare(image, effort = 3) {
+    const streams = filteredImages(image, width, height);
+    for (const candidate of candidatesFor(image, width, height, effort, streams)) {
+      if (!strongest || candidate.png.length < strongest.png.length) {
+        strongest = candidate;
+        chosenStreams = streams;
+      }
+    }
+  }
+  if (gray) compare(directImage(pixels, opaque ? 0 : 4), 4);
+  // A dense gray ramp already has an ordered one-byte representation.
+  if (indexed && (!gray || counts.size < 96)) {
+    const colors = Array.from(counts.keys());
+    compare(paletteImage(pixels, colors));
+    const luma = c => (c & 255) * 3 + ((c >>> 8) & 255) * 6 + ((c >>> 16) & 255);
+    const sorted = colors.slice().sort((a, b) => luma(a) - luma(b) || a - b);
+    if (sorted.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, sorted));
+    const frequent = colors.slice().sort((a, b) => counts.get(b) - counts.get(a) || a - b);
+    if (frequent.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, frequent));
+  }
+  // Small opaque flat palettes avoid repeating a full three-channel filter search.
+  if (!gray && (!indexed || !opaque || counts.size > 64)) compare(directImage(pixels, opaque ? 2 : 6), 4);
+  let result = strongest.png;
+  function refine(raw, image, compressor) {
+    const packed = compressor(raw);
+    if (!packed) return Infinity;
+    const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
+    if (png.length < result.length) result = png;
+    return png.length;
+  }
+  const image = strongest.image;
+  const alternatives = chosenStreams;
+  const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
+  const narrow = chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3);
+  const layouts = [strongest.raw, wide, narrow];
+  // A long strip keeps one predictor across repeated shapes. Dense RGB data
+  // changes faster, so compare shorter strips against the full 32 KiB history.
+  // Grayscale samples can switch predictors on each row at lower search cost.
+  if (image.mode !== 3) {
+    const denseRgb = image.mode === 2 && strongest.png.length > width * height * 0.30;
+    const rows = image.mode === 0 || image.mode === 4 ? 1 : denseRgb ? 2 : 16;
+    const level = rows === 1 ? 3 : rows === 2 ? 5 : 7;
+    layouts.push(chooseStrips(alternatives, width, height, image.channels, rows, 32768, level));
+  }
+  const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
+  const ranked = distinct.map(raw => ({
+    raw,
+    bytes: refine(raw, image, data => deflateSync(data, { level: 9, memLevel: 9 })),
+  })).sort((a, b) => a.bytes - b.bytes);
+  const bestSize = ranked[0].bytes;
+  const limit = bestSize < 40000 && image.mode === 0 ? 2 : 1;
+  const finalists = ranked.slice(0, limit);
+  if (bestSize <= 175000) {
+    const rows = image.mode === 0 || image.mode === 4 ? 5 : 8;
+    const sources = [...alternatives, ...ranked.map((candidate) => candidate.raw)];
+    const polished = polishStrips(ranked[0].raw, sources, width, height, image.channels, rows);
+    if (!ranked.some((candidate) => candidate.raw.equals(polished))) {
+      const bytes = refine(polished, image, (data) => deflateSync(data, { level: 9, memLevel: 9 }));
+      if (bytes <= bestSize * 1.005) {
+        finalists.push({ raw: polished, bytes });
+        finalists.sort((a, b) => a.bytes - b.bytes);
+      }
+    }
+  }
+  let winner;
+  for (const { raw } of finalists.filter(layout => layout.bytes <= bestSize * 1.02).slice(0, limit)) {
+    const packed = compressOptimally(raw);
+    if (packed && (!winner || packed.length < winner.packed.length)) winner = { raw, packed };
+  }
+  let outputImage = image;
+  if (image.mode === 3 && image.palette.length >= 6 && image.palette.length <= 192 && width * height >= 8192) {
+    const trials = [];
+    for (const copies of [4, 256]) {
+      for (const filter of [1, 2, 3, 4]) {
+        const candidate = residualPalette(image, width, height, filter, copies);
+        if (!candidate) continue;
+        const packed = deflateSync(candidate.raw, { level: 3, memLevel: 8 });
+        const trial = assemble(width, height, 3, packed, candidate.image.palette, candidate.image.transparency);
+        trials.push({ ...candidate, estimate: trial.length });
+      }
+    }
+    trials.sort((a, b) => a.estimate - b.estimate);
+    let contender;
+    for (const candidate of trials.slice(0, 2)) {
+      const bytes = refine(candidate.raw, candidate.image, (data) => deflateSync(data, { level: 9, memLevel: 9 }));
+      if (bytes < ranked[0].bytes * 0.998 && (!contender || bytes < contender.bytes)) contender = { ...candidate, bytes };
+    }
+    if (contender) {
+      const trialPacked = compressOptimally(contender.raw);
+      const overhead = (im) => im.palette.length + im.transparency.length + (im.transparency.length ? 12 : 0);
+      if (trialPacked && (!winner || trialPacked.length + overhead(contender.image) < winner.packed.length + overhead(image))) {
+        winner = { raw: contender.raw, packed: trialPacked };
+        outputImage = contender.image;
+      }
+    }
+  }
+  if (winner) {
+    const packed = repack(winner.raw, winner.packed, width * outputImage.channels + 1);
+    const png = assemble(width, height, outputImage.mode, packed, outputImage.palette, outputImage.transparency);
+    if (png.length < result.length) result = png;
+  }
+  return result;
+}

@@ -75,3 +75,42 @@ jobs:
       - name: Run twice with one CPU and compare all RGBA pixels
         run: |
           python3 -c 'import os,sys; os.sched_setaffinity(0,{min(os.sched_getaffinity(0))}); os.execvp("node",["node","check/practice.mjs",*sys.argv[1:]])' check/fresh-draw
+
+  official:
+    name: Official Docker practice grade
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - name: Extract the public kit and verify its CLI
+        run: |
+          mkdir -p "$RUNNER_TEMP/competition" "$RUNNER_TEMP/entry"
+          python3 - <<'PY'
+          import hashlib, os, tarfile
+          from pathlib import Path, PurePosixPath
+          from urllib.request import Request, urlopen
+          from shutil import copyfileobj
+          root = Path(os.environ['RUNNER_TEMP'], 'competition')
+          req = Request('https://make.fun/c/png-squeeze-01-run-20261127/kit', headers={'User-Agent': 'AtticKnight public practice validation'})
+          with urlopen(req, timeout=60) as response, tarfile.open(fileobj=response, mode='r|gz') as archive:
+              for item in archive:
+                  parts = PurePosixPath(item.name).parts
+                  if not item.isfile() or len(parts) < 2 or '..' in parts or parts[0].startswith('/'):
+                      continue
+                  path = root.joinpath(*parts[1:])
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  with path.open('wb') as dest:
+                      copyfileobj(archive.extractfile(item), dest)
+          cli = root / 'cli' / 'makefun.mjs'
+          assert hashlib.sha256(cli.read_bytes()).hexdigest() == 'c55cf087b775bbaeecc4369155853521db45b8500eb4355eeaae143e7b05c03c'
+          PY
+          git archive HEAD -- LICENSE README.md encoder.js main.ts optimal.js package.json repack.js vendor | tar -x -C "$RUNNER_TEMP/entry"
+      - name: Run the sponsor's Docker grading command
+        run: |
+          cd "$RUNNER_TEMP/competition"
+          node cli/makefun.mjs grade-local --kit . --bot "$RUNNER_TEMP/entry" --driver docker

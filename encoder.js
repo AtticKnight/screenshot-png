@@ -193,7 +193,7 @@ function candidatesFor(image, w, h, effort, streams) {
   const candidates = [];
   for (const index of indices) {
     const raw = streams[index];
-    const packed = deflateSync(raw, { level: 9, memLevel: 8 });
+    const packed = deflateSync(raw, { level: 7, memLevel: 8 });
     const png = assemble(w, h, image.mode, packed, image.palette, image.transparency);
     candidates.push({ png, raw, image, index });
   }
@@ -264,7 +264,7 @@ export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
   let strongest, chosenStreams;
-  function compare(image, effort = 3) {
+  function compare(image, effort = 2) {
     const streams = filteredImages(image, width, height);
     for (const candidate of candidatesFor(image, width, height, effort, streams)) {
       if (!strongest || candidate.png.length < strongest.png.length) {
@@ -273,7 +273,7 @@ export function encodeScreenshot(file) {
       }
     }
   }
-  if (gray) compare(directImage(pixels, opaque ? 0 : 4), 3);
+  if (gray) compare(directImage(pixels, opaque ? 0 : 4), 2);
   // A dense gray ramp already has an ordered one-byte representation.
   if (indexed && (!gray || counts.size < 96)) {
     const colors = Array.from(counts.keys());
@@ -282,7 +282,7 @@ export function encodeScreenshot(file) {
     const sorted = colors.slice().sort((a, b) => luma(a) - luma(b) || a - b);
     if (sorted.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, sorted));
     const frequent = colors.slice().sort((a, b) => counts.get(b) - counts.get(a) || a - b);
-    if (frequent.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, frequent));
+    if (colors.length <= 32 && frequent.some((c, i) => c !== colors[i])) compare(paletteImage(pixels, frequent), 1);
   }
   // Small opaque flat palettes avoid repeating a full three-channel filter search.
   if (!gray && (!indexed || !opaque || counts.size > 64)) compare(directImage(pixels, opaque ? 2 : 6), 2);
@@ -296,19 +296,19 @@ export function encodeScreenshot(file) {
   }
   const image = strongest.image;
   const alternatives = chosenStreams;
-  const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
+  const wide = chooseStrips(alternatives, width, height, image.channels, 10, 32768, 4);
   const dense = strongest.png.length > width * height * 0.21;
   const layouts = [strongest.raw, wide];
   if (!dense) {
-    layouts.push(chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3));
+    layouts.push(chooseStrips(alternatives, width, height, image.channels, 3, 4 * (width * image.channels + 1), 2));
   }
   // A long strip keeps one predictor across repeated shapes. Dense RGB data
   // changes faster, so compare shorter strips against the full 32 KiB history.
   // Grayscale samples can switch predictors on each row at lower search cost.
   if (image.mode !== 3) {
     const denseRgb = image.mode === 2 && strongest.png.length > width * height * 0.30;
-    const rows = image.mode === 0 || image.mode === 4 ? 1 : denseRgb ? 2 : 16;
-    const level = rows === 1 ? 3 : rows === 2 ? 5 : 7;
+    const rows = image.mode === 0 || image.mode === 4 ? 2 : denseRgb ? 4 : 16;
+    const level = rows === 16 ? 5 : 3;
     layouts.push(chooseStrips(alternatives, width, height, image.channels, rows, 32768, level));
   }
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
@@ -318,7 +318,7 @@ export function encodeScreenshot(file) {
   })).sort((a, b) => a.bytes - b.bytes);
   const bestSize = ranked[0].bytes;
   let raw = ranked[0].raw;
-  if (bestSize <= 125000) {
+  if (bestSize <= 65000) {
     const rows = image.mode === 0 || image.mode === 4 ? 5 : 8;
     const sources = [...alternatives, ...ranked.map((candidate) => candidate.raw)];
     const polished = polishStrips(ranked[0].raw, sources, width, height, image.channels, rows);
@@ -327,7 +327,7 @@ export function encodeScreenshot(file) {
       if (bytes < bestSize) raw = polished;
     }
   }
-  // One level-12 parse per image bounds the dominant compression work on dense sets.
+  // Run one near-optimal parse after choosing the filtered image.
   const candidate = compressOptimally(raw);
   if (candidate) {
     const packed = repack(raw, candidate);

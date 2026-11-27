@@ -1,7 +1,7 @@
 name: Verify screenshot compression
 on:
   push:
-    branches: [bench-png-fractional-symbol-costs]
+    branches: [bench-png-adaptive-filter-path]
 permissions:
   contents: read
 jobs:
@@ -107,7 +107,7 @@ jobs:
                   with path.open('wb') as dest:
                       copyfileobj(archive.extractfile(item), dest)
           cli = root / 'cli' / 'makefun.mjs'
-          assert hashlib.sha256(cli.read_bytes()).hexdigest() == '9dc1f2070da6de698d5aa789a2872dc6479d90f495479a4ddb81c589697b0e26'
+          assert hashlib.sha256(cli.read_bytes()).hexdigest() == 'c6bb345caa614f250942686dbad62e669c365b4ee582785667747b1119e84c70'
           PY
           git archive HEAD -- LICENSE README.md encoder.js main.ts optimal.js package.json repack.js vendor | tar -x -C "$RUNNER_TEMP/entry"
       - name: Run the sponsor's Docker grading command

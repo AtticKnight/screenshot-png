@@ -307,8 +307,8 @@ export function encodeScreenshot(file) {
   // Grayscale samples can switch predictors on each row at lower search cost.
   if (image.mode !== 3) {
     const denseRgb = image.mode === 2 && strongest.png.length > width * height * 0.30;
-    const rows = image.mode === 0 || image.mode === 4 ? 1 : denseRgb ? 2 : 16;
-    const level = rows === 1 ? 3 : rows === 2 ? 5 : 7;
+    const rows = image.mode === 0 || image.mode === 4 ? 1 : denseRgb ? 4 : 16;
+    const level = rows === 1 ? 3 : rows === 4 ? 4 : 6;
     layouts.push(chooseStrips(alternatives, width, height, image.channels, rows, 32768, level));
   }
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
@@ -318,7 +318,7 @@ export function encodeScreenshot(file) {
   })).sort((a, b) => a.bytes - b.bytes);
   const bestSize = ranked[0].bytes;
   let raw = ranked[0].raw;
-  if (bestSize <= 125000) {
+  if (bestSize <= 85000) {
     const rows = image.mode === 0 || image.mode === 4 ? 5 : 8;
     const sources = [...alternatives, ...ranked.map((candidate) => candidate.raw)];
     const polished = polishStrips(ranked[0].raw, sources, width, height, image.channels, rows);

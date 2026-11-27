@@ -465,7 +465,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
   const bestLengths = new Uint16Array(259),
     bestCosts = new Int32Array(259),
     high = 1 << 28;
-  let probesLeft = 1500000;
+  let probesLeft = 850000;
   for (const block of blocks) {
     const { start, end, type, final, literal, distance } = block;
     if (type === 0) {
@@ -976,26 +976,26 @@ function tuneHeaders(raw, base) {
 }
 
 export function repack(raw, packed) {
-  // Compare alternate parses of this filtered image. The first pass keeps the
-  // original block boundaries. The second uses the least expensive partition.
-  // Very dense streams already have many useful matches. Repartitioning their
-  // existing parse avoids a second expensive search over millions of samples.
-  if (packed.length > 255000) return tuneHeaders(raw, repartition(raw, packed, 320));
+  // Repricing stores a suffix cost at each input byte. Direct-colour layouts can
+  // contain four times as many bytes as a palette image, even at the same PNG size.
+  // Use token-level optimization for those layouts and reserve the full search
+  // for compact colour planes. Both budgets depend only on the input.
+  if (packed.length > 240000) return tuneHeaders(raw, packed);
+  if (packed.length > 115000 || (raw.length > 1400000 && packed.length > 55000)) {
+    return tuneHeaders(raw, repartition(raw, packed, 460));
+  }
   const alternatives = [
-    { level: 1, memLevel: 9 },
-    { level: 5, memLevel: 8 },
-    { level: 9, memLevel: 9 },
-  ].map((options) => deflateSync(raw, options));
+    deflateSync(raw, { level: 2, memLevel: 9 }),
+    deflateSync(raw, { level: 8, memLevel: 8 }),
+  ];
   const prior = priorOccurrences(raw);
   const runs = new Uint16Array(raw.length);
   for (let i = raw.length - 1; i >= 0; i--) {
     runs[i] = raw[i] === raw[i + 1] ? Math.min(258, runs[i + 1] + 1) : 1;
   }
-  const depth = packed.length > 150000 ? 32 : 72;
-  const first = reprice(raw, packed, alternatives, prior, runs, depth, 50000);
-  const grouped = repartition(raw, first, 240);
-  const final = packed.length > 150000
-    ? grouped
-    : reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, 48, 16000);
-  return tuneHeaders(raw, final);
+  const first = raw.length > 1400000
+    ? reprice(raw, packed, alternatives, prior, runs, 24, 12000)
+    : reprice(raw, packed, alternatives, prior, runs, 48, 32000);
+  const grouped = repartition(raw, first, 280);
+  return tuneHeaders(raw, grouped);
 }

@@ -1,23 +1,17 @@
 # Screenshot PNG
 
-A lossless encoder for 8-bit RGBA screenshots. It chooses among direct color, grayscale and palette representations. Fixed PNG filters, per-row predictors and filter choices shared across strips compete on actual compressed size. A second strip pass retains up to 32 KiB of previous scanlines. It tests single rows for grayscale, two rows for dense direct-color streams and sixteen rows for other direct-color streams. A near-optimal libdeflate parse ranks the remaining layouts. Compact streams get another two or four Zopfli iterations, depending on their compressed size.
+A lossless JavaScript encoder for 8-bit RGBA screenshots. It tests grayscale, indexed color and direct color, and keeps the smallest complete PNG it produces. It preserves all four channels, including the RGB values of fully transparent pixels.
 
-Run `node main.ts` on Node.js 22.18 or later. The program reads one `image.png` per input subdirectory and writes a PNG of the same name and subdirectory to the output. The environment variables `MAKEFUN_INPUT_DIR` and `MAKEFUN_OUTPUT_DIR` default to `/input` and `/output`. It runs offline with the two checked-in compressors.
+Run `node main.ts` on Node.js 22.18 or later. The program reads one `image.png` from every subdirectory under `MAKEFUN_INPUT_DIR` and writes the same name and subdirectory under `MAKEFUN_OUTPUT_DIR`. Those directories default to `/input` and `/output`.
 
-## Rebuild the compressors
+## Encoding
 
-On Ubuntu 24.04 install clang-18, lld-18, emscripten and Python 3. From this repository's root run the following commands with clean checkouts of the pinned upstream revisions.
+The encoder compares fixed PNG row filters, two row-by-row predictors, and strips selected against a dictionary of preceding scanlines. For grayscale, it also tests one-row strips with a full 32 KiB dictionary. For direct color, it tests two- or sixteen-row strips according to the measured compression density. Node's built-in zlib ranks these filtered streams. A JavaScript implementation of libdeflate's level-12 parser then compresses the two shortest candidates.
 
-```sh
-sh build/native-lib.sh /path/to/libdeflate
-sh build/zopfli.sh /path/to/zopfli
-sha256sum vendor/libdeflate.wasm vendor/zopfli.cjs
-```
+The released compressor is a self-contained JavaScript module generated from libdeflate. It runs as JavaScript when WebAssembly is unavailable. The MIT license is included in `vendor/COPYING`. The exact upstream source and build recipe are public. [Upstream libdeflate](https://github.com/ebiggers/libdeflate/tree/96836d7d9d10e3e0d53e6edb54eb908514e336c4) · [Rebuild instructions and compiler invocation](https://github.com/AtticKnight/screenshot-png/blob/581504201bc18ca451698597c7aff183d94f6815/build/compile.sh)
 
-The [libdeflate source](https://github.com/ebiggers/libdeflate/tree/96836d7d9d10e3e0d53e6edb54eb908514e336c4) supplies the MIT-licensed level-12 parser. Its WebAssembly module has SHA-256 `9cc3dce3905a01aaf132c22aad6bfb6fdb61cc67eb0b03f1a856423cb9694a99`. The [Zopfli source](https://github.com/google/zopfli/tree/bd64b2f0553d4f1ef4e6627647c5d9fc8c71ffc0) supplies the Apache-2.0 optimal parser. Its single-file Emscripten build has SHA-256 `c234076f2956dc38915fb3eb8679ee7d1bdd9792f00a35a1914d02cc868c55a3`. The build applies a search cap, SIMD match comparisons and precomputed symbol costs to a temporary upstream copy. The parser updates several candidate lengths together when both the length and distance symbols have the same price. It preserves the comparison between each double-precision price and the stored single-precision cost.
+## Verification
 
-I developed and tested the image representation, prediction, integration and local compressor changes with OpenAI Codex for the [make.fun screenshot challenge](https://make.fun/bounty/png-squeeze-01-run-20261127).
+Fifteen compressor round trips passed with WebAssembly disabled in Node. Four fresh executions of the normal entry point compared every decoded RGBA pixel and checked repeated output byte for byte. On the published practice set the encoder produced 491,873 bytes and scored 779,849 in 46.86 and 45.61 seconds. On an independently seeded set it produced 1,287,221 bytes and scored 766,834 in 52.72 and 52.98 seconds. Both sets contained eight screenshots. [Verification job](https://github.com/AtticKnight/screenshot-png/actions/runs/46012982568/job/140552905529)
 
-The normal entry point ran twice in fresh processes on each of two sets of eight screenshots. Each pair produced identical files, and the verifier compared every decoded RGBA pixel with the input. On the published practice set the runs took 51.63 and 51.47 seconds, produced 485,321 bytes and scored 791,954. On an independently seeded set the runs took 39.85 and 39.89 seconds, produced 1,283,078 bytes and scored 777,377. [Entry-point verification](https://github.com/AtticKnight/screenshot-png/actions/runs/46008990604/job/140539331738)
-
-A separate regression check compared two-pass compressed output against the previous parser on 52 generated byte streams. All 52 comparisons were byte-identical. [Parser regression check](https://github.com/AtticKnight/screenshot-png/actions/runs/46000358066/job/140510130170)
+I developed and tested the image representation, predictor selection and integration with OpenAI Codex for the [make.fun screenshot challenge](https://make.fun/bounty/png-squeeze-01-run-20261127).

@@ -1,7 +1,6 @@
 import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
-
 import { compressOptimally } from './optimal.js';
-import { compressWithZopfli } from './zopfli.js';
+
 
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -277,14 +276,12 @@ export function encodeScreenshot(file) {
     layouts.push(chooseStrips(alternatives, width, height, image.channels, rows, 32768, level));
   }
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
-  let bestRaw = distinct[0], bestSize = Infinity;
-  for (const raw of distinct) {
-    const size = refine(raw, image, compressOptimally);
-    if (size < bestSize) { bestSize = size; bestRaw = raw; }
-  }
-  // The entropy-model pass spends most of its time parsing the remaining tokens.
-  // On large residual streams use the already measured near-optimal parse.
-  // This fixed input-derived budget applies identically across all screenshots.
-  if (bestSize <= 128 * 1024) refine(bestRaw, image, raw => compressWithZopfli(raw, bestSize < 49152 ? 4 : 2));
+  const ranked = distinct.map(raw => ({
+    raw,
+    bytes: refine(raw, image, data => deflateSync(data, { level: 9, memLevel: 9 })),
+  })).sort((a, b) => a.bytes - b.bytes);
+  // The first pass compares layout sizes cheaply. A near-optimal DEFLATE
+  // parse on the two shortest gives each a chance with a richer cost model.
+  for (const { raw } of ranked.slice(0, 2)) refine(raw, image, compressOptimally);
   return result;
 }

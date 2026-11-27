@@ -1,6 +1,4 @@
-import { readFileSync } from 'node:fs';
-const module = new WebAssembly.Module(readFileSync(new URL('./vendor/libdeflate.wasm', import.meta.url)));
-const { memory, input_pointer, output_pointer, prepare, compress_image } = new WebAssembly.Instance(module).exports;
+import { memory, input_pointer, output_pointer, prepare, compress_image } from './vendor/libdeflate.js';
 
 const heap = new Uint8Array(memory.buffer);
 const inputStart = input_pointer();

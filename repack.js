@@ -1050,24 +1050,111 @@ function writeStored(writer, raw, start, end, final) {
   for (let i = start; i < end; i++) writer.write(raw[i], 8);
 }
 
+// The code that minimizes weighted payload length need not minimize a DEFLATE
+// block. Equalizing neighboring low counts can shorten the run-length-coded tree.
+function regularizedCounts(counts, softness, fillHoles) {
+  const weights = Float64Array.from(counts);
+  let last = counts.length - 1;
+  while (last > 0 && !counts[last]) last--;
+  for (let begin = 0; begin <= last;) {
+    if (!counts[begin]) { begin++; continue; }
+    let sum = counts[begin], end = begin + 1;
+    for (; end <= last; end++) {
+      const count = counts[end], average = sum / (end - begin);
+      if (!count && (!fillHoles || end === last || !counts[end + 1] || average > 2.9)) break;
+      if (Math.abs(count - average) > Math.max(softness, average * softness * 0.14)) break;
+      sum += count;
+    }
+    if (end - begin >= 3) {
+      const mean = Math.max(0.5, sum / (end - begin));
+      weights.fill(mean, begin, end);
+    }
+    begin = end;
+  }
+  return weights;
+}
+function blockBooks(counts) {
+  const out = [];
+  const signatures = new Set();
+  for (const [softness, fill, depth] of [[0, false, 15], [0, false, 11],
+      [1.0, false, 15], [2.3, true, 15], [4.0, true, 12], [7.0, true, 10]]) {
+    const freq = softness ? regularizedCounts(counts, softness, fill) : counts;
+    const lengths = optimalLengths(freq, depth);
+    const signature = Buffer.from(lengths).toString('base64');
+    if (signatures.has(signature)) continue;
+    signatures.add(signature);
+    let cost = 0;
+    for (let i = 0; i < counts.length; i++) cost += counts[i] * lengths[i];
+    out.push({ lengths, cost });
+  }
+  return out;
+}
 function tuneHeaders(raw, base) {
-  const { blocks } = readPlan(base, raw.length, true);
+  const plan = readPlan(base, raw.length, true);
   const reader = new BitReader(base.subarray(2, -4));
   const writer = new BitWriter(base.length);
-  for (const block of blocks) {
+  let match = 0;
+  for (const block of plan.blocks) {
     if (block.type === 0) {
       writeStored(writer, raw, block.start, block.end, block.final);
       continue;
     }
-    const trial = block.type === 2
-      ? encodeCodebook(block.literal.lens, block.distance.lens, block.final, true)
-      : null;
-    if (trial && trial.at < block.dataStart - block.header) {
-      writer.copy(new BitReader(trial.bytes), 0, trial.at);
-    } else {
-      writer.copy(reader, block.header, block.dataStart);
+    const firstMatch = match;
+    const lc = new Uint32Array(286), dc = new Uint32Array(30);
+    let extra = 0;
+    for (let at = block.start; at < block.end;) {
+      if (match < plan.positions.length && plan.positions[match] === at) {
+        const n = plan.lengths[match], d = plan.distances[match++];
+        const ls = symbolForLength[n], ds = symbolForDistance[d];
+        lc[ls]++; dc[ds]++; extra += lengthExtra[ls - 257] + distanceExtra[ds];
+        at += n;
+      } else lc[raw[at++]]++;
     }
-    writer.copy(reader, block.dataStart, block.dataEnd);
+    lc[256]++;
+    let original = null, best = null;
+    let bestBits = block.dataEnd - block.header;
+    if (block.type === 2) {
+      const runHeader = encodeCodebook(block.literal.lens, block.distance.lens, block.final, true);
+      const bits = runHeader.at + block.dataEnd - block.dataStart;
+      if (bits < bestBits) { original = runHeader; bestBits = bits; }
+    }
+    const finalists = [];
+    const literals = blockBooks(lc), distances = blockBooks(dc);
+    for (const l of literals) for (const d of distances) {
+      const dataBits = l.cost + d.cost + extra;
+      if (dataBits + 25 >= bestBits) continue;
+      const header = encodeCodebook(l.lengths, d.lengths, block.final);
+      const bits = dataBits + header.at;
+      if (bits < bestBits) { best = { l, d, header }; bestBits = bits; }
+      finalists.push({ l, d, dataBits, bits });
+    }
+    finalists.sort((a, b) => a.bits - b.bits);
+    for (const { l, d, dataBits } of finalists.slice(0, 2)) {
+      const header = encodeCodebook(l.lengths, d.lengths, block.final, true);
+      const bits = header.at + dataBits;
+      if (bits < bestBits) { best = { l, d, header }; bestBits = bits; }
+    }
+    if (!best) {
+      if (original) writer.copy(new BitReader(original.bytes), 0, original.at);
+      else writer.copy(reader, block.header, block.dataStart);
+      writer.copy(reader, block.dataStart, block.dataEnd);
+      continue;
+    }
+    writer.copy(new BitReader(best.header.bytes), 0, best.header.at);
+    const literal = prefixTree(best.l.lengths, false), distance = prefixTree(best.d.lengths, false);
+    let j = firstMatch;
+    for (let at = block.start; at < block.end;) {
+      if (j < match && plan.positions[j] === at) {
+        const n = plan.lengths[j], d = plan.distances[j++];
+        const ls = symbolForLength[n], ds = symbolForDistance[d];
+        printSymbol(writer, literal, ls);
+        writer.write(n - lengthBase[ls - 257], lengthExtra[ls - 257]);
+        printSymbol(writer, distance, ds);
+        writer.write(d - distanceBase[ds], distanceExtra[ds]);
+        at += n;
+      } else printSymbol(writer, literal, raw[at++]);
+    }
+    printSymbol(writer, literal, 256);
   }
   const result = Buffer.concat([
     base.subarray(0, 2),

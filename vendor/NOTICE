@@ -1,0 +1,5 @@
+The screenshot encoder, prediction and integration code are by AtticKnight, written with OpenAI Codex, 2026.
+
+libdeflate 1.24 by Eric Biggers and contributors is distributed under the MIT license in COPYING. The compiled WebAssembly build uses the local restricted allocator and buffer wrapper in build/port.c.
+
+Zopfli by Google Inc. and contributors is distributed under the Apache License 2.0 in ZOPFLI-LICENSE. This distribution was modified on 27 November 2026. The build applies a fixed hash-chain search bound, a bounds-checked SIMD byte comparison and an exact length-distance cost table. Reproducible changes to the pinned upstream source are in build/accelerate-zopfli.py.

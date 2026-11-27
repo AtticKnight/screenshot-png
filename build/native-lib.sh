@@ -13,11 +13,5 @@ clang-18 --target=wasm32-unknown-unknown -O3 -flto -ffreestanding -nostdlib \
   -fuse-ld=/usr/bin/wasm-ld-18 -Wl,--no-entry -Wl,--export-memory -Wl,-z,stack-size=1048576 \
   -Wl,--initial-memory=83886080 -Wl,--max-memory=83886080 \
   -Wl,--export=prepare -Wl,--export=input_pointer -Wl,--export=output_pointer \
-  -Wl,--export=compress_image -o "$TMPDIR/libdeflate.wasm"
-wasm2js "$TMPDIR/libdeflate.wasm" -O3 -o "$TMPDIR/libdeflate.js"
-{
-  echo '/* libdeflate 1.24, Copyright 2016 Eric Biggers and 2024 Google LLC.'
-  echo ' * Generated JavaScript. Licence in vendor/COPYING. Rebuild with build/compile.sh. */'
-  cat "$TMPDIR/libdeflate.js"
-} > vendor/libdeflate.js
+  -Wl,--export=compress_image -o vendor/libdeflate.wasm
 cmp vendor/COPYING "$source_dir/COPYING"

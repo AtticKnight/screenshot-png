@@ -1,5 +1,6 @@
 import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
 import { compressOptimally } from './optimal.js';
+import { repack } from './repack.js';
 
 
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -280,8 +281,18 @@ export function encodeScreenshot(file) {
     raw,
     bytes: refine(raw, image, data => deflateSync(data, { level: 9, memLevel: 9 })),
   })).sort((a, b) => a.bytes - b.bytes);
-  // The first pass compares layout sizes cheaply. A near-optimal DEFLATE
-  // parse on the two shortest gives each a chance with a richer cost model.
-  for (const { raw } of ranked.slice(0, 2)) refine(raw, image, compressOptimally);
+  // On dense screens the top-ranked layout gets the expensive match search.
+  // Smaller streams can compare two layouts within the per-set work budget.
+  const limit = ranked[0].bytes > 180000 ? 1 : 2;
+  let winner;
+  for (const { raw } of ranked.slice(0, limit)) {
+    const packed = compressOptimally(raw);
+    if (packed && (!winner || packed.length < winner.packed.length)) winner = { raw, packed };
+  }
+  if (winner) {
+    const packed = repack(winner.raw, winner.packed);
+    const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
+    if (png.length < result.length) result = png;
+  }
   return result;
 }

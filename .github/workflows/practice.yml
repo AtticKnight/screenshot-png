@@ -34,6 +34,8 @@ jobs:
           }
           console.log('JavaScript round trips with WebAssembly unavailable', samples);
           JS
+      - name: Check recompression of stored, fixed and dynamic DEFLATE streams
+        run: node --no-expose-wasm check/repack.mjs
       - name: Read the published practice data and checker
         run: python3 check/fetch.py
       - name: Check every pixel, compare the house entry and repeat under the 60-second limit

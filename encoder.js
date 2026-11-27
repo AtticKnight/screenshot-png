@@ -1,6 +1,7 @@
 import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
 
 import { compressOptimally } from './optimal.js';
+import { compressWithZopfli } from './zopfli.js';
 
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -183,8 +184,7 @@ function filteredImages(image, width, height) {
   return streams;
 }
 
-function candidatesFor(image, w, h, effort) {
-  const streams = filteredImages(image, w, h);
+function candidatesFor(image, w, h, effort, streams) {
   const order = streams.map((raw, index) => ({
     index, bytes: deflateSync(raw, { level: 3, memLevel: 9 }).length,
   })).sort((a, b) => a.bytes - b.bytes);
@@ -203,14 +203,14 @@ function candidatesFor(image, w, h, effort) {
 // Compare complete strips against the same prefix dictionary. Fixed Paeth, for
 // example, can work well across a soft shadow and poorly in a table of flat fills.
 // Previous choices become the dictionary for the next group of rows.
-function chooseStrips(streams, w, h, channels, stripHeight) {
+function chooseStrips(streams, w, h, channels, stripHeight, history, level) {
   const stride = w * channels + 1;
   const selected = Buffer.allocUnsafe(stride * h);
   for (let y = 0; y < h; y += stripHeight) {
     const start = y * stride;
     const end = Math.min(h, y + stripHeight) * stride;
-    const options = { level: 5, memLevel: 7 };
-    if (start) options.dictionary = selected.subarray(Math.max(0, start - 32768), start);
+    const options = { level, memLevel: 7 };
+    if (start) options.dictionary = selected.subarray(Math.max(0, start - history), start);
     let best = null, bestSize = Infinity;
     for (const stream of streams) {
       const strip = stream.subarray(start, end);
@@ -228,9 +228,15 @@ function chooseStrips(streams, w, h, channels, stripHeight) {
 export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
-  const candidates = [];
+  let strongest, chosenStreams;
   function compare(image, effort = 3) {
-    candidates.push(...candidatesFor(image, width, height, effort));
+    const streams = filteredImages(image, width, height);
+    for (const candidate of candidatesFor(image, width, height, effort, streams)) {
+      if (!strongest || candidate.png.length < strongest.png.length) {
+        strongest = candidate;
+        chosenStreams = streams;
+      }
+    }
   }
   if (gray) compare(directImage(pixels, opaque ? 0 : 4), 4);
   if (indexed) {
@@ -243,18 +249,28 @@ export function encodeScreenshot(file) {
     if (frequent.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, frequent));
   }
   if (!gray) compare(directImage(pixels, opaque ? 2 : 6), 4);
-  candidates.sort((a,b) => a.png.length - b.png.length);
-  const strongest = candidates[0];
   let result = strongest.png;
-  function refine(raw, image) {
-    const packed = compressOptimally(raw);
-    if (!packed) return;
+  function refine(raw, image, compressor) {
+    const packed = compressor(raw);
+    if (!packed) return Infinity;
     const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
     if (png.length < result.length) result = png;
+    return png.length;
   }
-  refine(strongest.raw, strongest.image);
-  const alternatives = filteredImages(strongest.image, width, height);
-  const strips = chooseStrips(alternatives, width, height, strongest.image.channels, 8);
-  if (!strips.equals(strongest.raw)) refine(strips, strongest.image);
+  const image = strongest.image;
+  const alternatives = chosenStreams;
+  const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
+  const narrow = chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3);
+  const layouts = [strongest.raw, wide, narrow];
+  const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
+  let bestRaw = distinct[0], bestSize = Infinity;
+  for (const raw of distinct) {
+    const size = refine(raw, image, compressOptimally);
+    if (size < bestSize) { bestSize = size; bestRaw = raw; }
+  }
+  // The entropy-model pass spends most of its time parsing the remaining tokens.
+  // On large residual streams use the already measured near-optimal parse.
+  // This fixed input-derived budget applies identically across all screenshots.
+  if (bestSize <= 128 * 1024) refine(bestRaw, image, compressWithZopfli);
   return result;
 }

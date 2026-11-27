@@ -980,8 +980,8 @@ export function repack(raw, packed) {
   // contain four times as many bytes as a palette image, even at the same PNG size.
   // Use token-level optimization for those layouts and reserve the full search
   // for compact colour planes. Both budgets depend only on the input.
-  if (packed.length > 190000) return tuneHeaders(raw, packed);
-  if (raw.length > 1400000 || packed.length > 65000) {
+  if (packed.length > 240000) return tuneHeaders(raw, packed);
+  if (packed.length > 115000 || (raw.length > 1400000 && packed.length > 55000)) {
     return tuneHeaders(raw, repartition(raw, packed, 460));
   }
   const alternatives = [
@@ -993,7 +993,9 @@ export function repack(raw, packed) {
   for (let i = raw.length - 1; i >= 0; i--) {
     runs[i] = raw[i] === raw[i + 1] ? Math.min(258, runs[i + 1] + 1) : 1;
   }
-  const first = reprice(raw, packed, alternatives, prior, runs, 40, 26000);
+  const first = raw.length > 1400000
+    ? reprice(raw, packed, alternatives, prior, runs, 24, 12000)
+    : reprice(raw, packed, alternatives, prior, runs, 48, 32000);
   const grouped = repartition(raw, first, 280);
   return tuneHeaders(raw, grouped);
 }

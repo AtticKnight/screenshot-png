@@ -111,6 +111,71 @@ function paletteImage(pixels, colors) {
   return { data, mode: 3, channels: 1, palette: table, transparency: alphas.subarray(0, alphaLength) };
 }
 
+// Assign neighboring colors palette indices whose signed differences recur.
+// The transition counts come from this image's horizontal and vertical edges.
+function paletteByTransitions(pixels, width, colors) {
+  const n = colors.length;
+  if (n < 3) return colors;
+  const original = paletteImage(pixels,colors).data;
+  const counts = new Uint32Array(n*n);
+  for (let p = 0; p < original.length; p++) {
+    const v = original[p];
+    if (p % width !== 0 && original[p-1] !== v) counts[original[p-1]*n+v]++;
+    if (p >= width && original[p-width] !== v) counts[original[p-width]*n+v]++;
+  }
+  const adjacent = Array.from({length:n},()=>[]);
+  const edges = [];
+  const bucket = new Float64Array(256);
+  const position = Uint16Array.from({length:n},(_,i)=>i);
+  for (let a = 0; a < n; a++) for (let b = 0; b < n; b++) {
+    const weight = counts[a*n+b];
+    if (!weight) continue;
+    const id = edges.length;
+    edges.push({a,b,weight});
+    adjacent[a].push(id);
+    adjacent[b].push(id);
+    bucket[(b-a)&255] += weight;
+  }
+  if (!edges.length) return colors;
+  const information = value => value ? value*Math.log2(value) : 0;
+  const delta = new Float64Array(256), touched = new Uint16Array(256);
+  const seenBucket = new Uint32Array(256), seenEdge = new Uint32Array(edges.length);
+  let seed = 147312665;
+  const next = () => (seed=(Math.imul(seed,1664525)+1013904223)>>>0);
+  const attempts = Math.min(7500,Math.max(600,n*n*2));
+  for (let step = 1; step <= attempts; step++) {
+    const a = (next()>>>8)%n, b = (next()>>>8)%n;
+    if (a === b) continue;
+    const pa = position[a], pb = position[b];
+    let affected = 0;
+    for (const node of [a,b]) for (const id of adjacent[node]) {
+      if (seenEdge[id] === step) continue;
+      seenEdge[id] = step;
+      const e = edges[id];
+      const before = (position[e.b]-position[e.a])&255;
+      const left = e.a === a ? pb : e.a === b ? pa : position[e.a];
+      const right = e.b === a ? pb : e.b === b ? pa : position[e.b];
+      const after = (right-left)&255;
+      if (before === after) continue;
+      if (seenBucket[before] !== step) { seenBucket[before]=step; touched[affected++]=before; delta[before]=0; }
+      if (seenBucket[after] !== step) { seenBucket[after]=step; touched[affected++]=after; delta[after]=0; }
+      delta[before] -= e.weight; delta[after] += e.weight;
+    }
+    let gain = 0;
+    for (let i = 0; i < affected; i++) {
+      const k = touched[i];
+      gain += information(bucket[k]+delta[k])-information(bucket[k]);
+    }
+    if (gain > 0.00001) {
+      position[a]=pb; position[b]=pa;
+      for (let i = 0; i < affected; i++) bucket[touched[i]]+=delta[touched[i]];
+    }
+  }
+  const sorted = new Array(n);
+  for (let i = 0; i < n; i++) sorted[position[i]] = colors[i];
+  return sorted;
+}
+
 function directImage(pixels, mode) {
   if (mode === 6) return { data: pixels, mode, channels: 4 };
   const channels = mode === 0 ? 1 : mode === 4 ? 2 : 3;
@@ -241,6 +306,10 @@ export function encodeScreenshot(file) {
     if (sorted.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, sorted));
     const frequent = colors.slice().sort((a, b) => counts.get(b) - counts.get(a) || a - b);
     if (frequent.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, frequent));
+    if (!gray) {
+      const optimized = paletteByTransitions(pixels, width, colors);
+      if (optimized.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, optimized));
+    }
   }
   if (!gray) compare(directImage(pixels, opaque ? 2 : 6), 4);
   candidates.sort((a,b) => a.png.length - b.png.length);

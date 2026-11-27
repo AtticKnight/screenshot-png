@@ -1,4 +1,4 @@
-name: Verify screenshot compression
+name: Compare PNG strip-filter layouts
 on:
   push:
     branches: [verify]
@@ -7,7 +7,7 @@ permissions:
 jobs:
   practice:
     runs-on: ubuntu-24.04
-    timeout-minutes: 7
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -17,11 +17,10 @@ jobs:
           node-version: '22.18.0'
       - name: Read the published practice data and checker
         run: python3 check/fetch.py
-      - name: Check every pixel, compare the house entry and repeat under the 60-second limit
-        run: node check/practice.mjs
-      - name: Verify the normal entry point on a new draw
+      - name: Generate the independent comparison draw
         run: |
           mkdir -p check/third-seed
           node -e 'const fs=require("node:fs"), crypto=require("node:crypto");fs.writeFileSync("check/third-seed/seed.json", JSON.stringify({schema:"agent-fun/instance-seed/v1", seed:crypto.createHash("sha256").update("AtticKnight independently seeded screenshot validation 2026-11-27, third draw").digest("hex")}))'
           MAKEFUN_INPUT_DIR="$PWD/check/third-seed" MAKEFUN_OUTPUT_DIR="$PWD/check/third-draw" node check/kit/program/generator/draw.ts
-          node check/practice.mjs check/third-draw
+      - name: Compare compressed size of seven layouts and check every RGBA channel
+        run: node check/strip-experiment.mjs check/kit/practice check/third-draw

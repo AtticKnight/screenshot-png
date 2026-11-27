@@ -249,9 +249,10 @@ export function encodeScreenshot(file) {
   let result = strongest.png;
   function refine(raw, image, compressor) {
     const packed = compressor(raw);
-    if (!packed) return;
+    if (!packed) return Infinity;
     const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
     if (png.length < result.length) result = png;
+    return png.length;
   }
   const image = strongest.image;
   const alternatives = filteredImages(image, width, height);
@@ -263,7 +264,13 @@ export function encodeScreenshot(file) {
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
   const ranked = distinct.map(raw => ({ raw, size: deflateSync(raw, {level:9}).length }))
     .sort((a, b) => a.size - b.size);
-  for (const candidate of ranked.slice(0, 2)) refine(candidate.raw, image, compressOptimally);
-  refine(ranked[0].raw, image, compressWithZopfli);
+  // A quick zlib pass and a near-optimal parse can prefer different predictors.
+  // Select the input to the two-pass entropy model from measured libdeflate sizes.
+  let bestRaw = ranked[0].raw, bestSize = Infinity;
+  for (const candidate of ranked) {
+    const size = refine(candidate.raw, image, compressOptimally);
+    if (size < bestSize) { bestSize = size; bestRaw = candidate.raw; }
+  }
+  refine(bestRaw, image, compressWithZopfli);
   return result;
 }

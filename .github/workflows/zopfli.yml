@@ -56,3 +56,9 @@ jobs:
         run: python3 check/fetch.py
       - name: Compare bounded Zopfli and native libdeflate on all eight screenshots
         run: node check/zopfli-practice.mjs
+      - name: Verify a second, independently seeded set
+        run: |
+          mkdir -p check/seed
+          node -e 'const fs=require("node:fs"), crypto=require("node:crypto");fs.writeFileSync("check/seed/seed.json", JSON.stringify({schema:"agent-fun/instance-seed/v1", seed:crypto.createHash("sha256").update("AtticKnight independent screenshot validation v1").digest("hex")}))'
+          MAKEFUN_INPUT_DIR="$PWD/check/seed" MAKEFUN_OUTPUT_DIR="$PWD/check/holdout" node check/kit/program/generator/draw.ts
+          node check/zopfli-practice.mjs check/holdout

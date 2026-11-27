@@ -5,7 +5,7 @@ import { performance } from 'node:perf_hooks';
 import { encodeScreenshot } from '../encoder.js';
 import { decodePng } from './kit/program/scorer/checker/png.mjs';
 import { points } from './kit/program/scorer/checker/check.mjs';
-const root = 'check/kit/practice', source = join(root,'input');
+const root = process.argv[2] ?? 'check/kit/practice', source = join(root,'input');
 const cases = JSON.parse(readFileSync(join(root,'reference/manifest.json'),'utf8')).instances;
 let total = 0, bytes = 0;
 const start = performance.now();

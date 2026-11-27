@@ -13,7 +13,7 @@ with urlopen(request, timeout=60) as response, open_tar(fileobj=response, mode='
         if not member.isfile() or len(parts) < 2 or '..' in parts or parts[0].startswith('/'):
             continue
         name = '/'.join(parts[1:])
-        if not name.startswith(('practice/', 'program/scorer/checker/', 'baselines/fixed-paeth/', 'program/generator/subject/scale.mjs')):
+        if not name.startswith(('practice/', 'program/scorer/checker/', 'baselines/fixed-paeth/', 'program/generator/')):
             continue
         destination = target / name
         destination.parent.mkdir(parents=True, exist_ok=True)

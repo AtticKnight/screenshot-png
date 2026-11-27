@@ -447,12 +447,13 @@ export function encodeScreenshot(file) {
       }
     }
   }
-  if (bestSize <= 195000) {
+  let extraLayout;
+  if (bestSize <= 135000) {
     const start = finalists[0];
     const adjusted = polishBoundaryRows(start.raw, alternatives, width, height, image.channels);
     if (!adjusted.equals(start.raw)) {
       const bytes = refine(adjusted, image, raw => deflateSync(raw, { level: 9, memLevel: 9 }));
-      if (bytes + Math.max(4, start.bytes * 0.0002) < start.bytes) finalists.unshift({ raw: adjusted, bytes });
+      if (bytes + Math.max(4, start.bytes * 0.0002) < start.bytes) extraLayout = adjusted;
     }
   }
   let winner;
@@ -461,9 +462,19 @@ export function encodeScreenshot(file) {
     if (packed && (!winner || packed.length < winner.packed.length)) winner = { raw, packed };
   }
   if (winner) {
-    const packed = repack(winner.raw, winner.packed, width * image.channels + 1);
-    const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
-    if (png.length < result.length) result = png;
+    const rowBytes = width * image.channels + 1;
+    const finish = (raw, compressed) => {
+      const packed = repack(raw, compressed, rowBytes);
+      const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
+      if (png.length < result.length) result = png;
+    };
+    finish(winner.raw, winner.packed);
+    // A smaller zlib preview can lose after optimal parsing and block splitting.
+    // Preserve the fully optimized incumbent and compare actual output bytes.
+    if (extraLayout && !extraLayout.equals(winner.raw)) {
+      const alternative = compressOptimally(extraLayout);
+      if (alternative && alternative.length < winner.packed.length) finish(extraLayout, alternative);
+    }
   }
   return result;
 }

@@ -260,6 +260,57 @@ function polishStrips(base, sources, width, height, channels, rows) {
   return result;
 }
 
+// Repeating a small palette lets the same color use several legal indices.
+// For a fixed row predictor, choose the index with the smallest signed residual.
+// The decoder reconstructs the selected indices and every copy maps to the
+// exact same RGBA value. Trim both palette chunks to the entries actually used.
+function residualPalette(image, width, height, filter, copies) {
+  const colors = image.palette.length / 3;
+  const period = 2 ** Math.ceil(Math.log2(colors));
+  const extent = Math.min(period * copies, 256);
+  if (extent <= period) return null;
+  const highestCopy = extent / period - 1;
+  const data = Buffer.allocUnsafe(width * height);
+  const raw = Buffer.allocUnsafe((width + 1) * height);
+  let high = 0;
+  for (let y = 0; y < height; y++) {
+    let from = y * width, at = y * (width + 1);
+    raw[at++] = filter;
+    for (let x = 0; x < width; x++, from++, at++) {
+      const left = x === 0 ? 0 : data[from - 1];
+      const above = y === 0 ? 0 : data[from - width];
+      const corner = x && y ? data[from - width - 1] : 0;
+      const predict = filter === 1 ? left : filter === 2 ? above :
+        filter === 3 ? (left + above) >>> 1 : paeth(left, above, corner);
+      const rank = image.data[from];
+      let index;
+      if (extent === 256) {
+        const half = period >>> 1;
+        const delta = ((rank - predict + half) & (period - 1)) - half;
+        index = (predict + delta) & 255;
+      } else {
+        const k = Math.min(highestCopy, Math.max(0, Math.round((predict - rank) / period)));
+        index = rank + period * k;
+      }
+      data[from] = index;
+      raw[at] = index - predict;
+      if (index > high) high = index;
+    }
+  }
+  const palette = Buffer.alloc((high + 1) * 3), alpha = Buffer.alloc(high + 1, 255);
+  let lastAlpha = 0;
+  for (let i = 0; i <= high; i++) {
+    const q = i & (period - 1), base = q < colors ? q : 0;
+    image.palette.copy(palette, i * 3, base * 3, base * 3 + 3);
+    if (base < image.transparency.length && image.transparency[base] !== 255) {
+      alpha[i] = image.transparency[base];
+      lastAlpha = i + 1;
+    }
+  }
+  const remapped = { mode: 3, channels: 1, palette, transparency: alpha.subarray(0, lastAlpha) };
+  return { raw, image: remapped };
+}
+
 export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
@@ -333,9 +384,36 @@ export function encodeScreenshot(file) {
     const packed = compressOptimally(raw);
     if (packed && (!winner || packed.length < winner.packed.length)) winner = { raw, packed };
   }
+  let outputImage = image;
+  if (image.mode === 3 && image.palette.length >= 6 && image.palette.length <= 192 && width * height >= 8192) {
+    const trials = [];
+    for (const copies of [4, 256]) {
+      for (const filter of [1, 2, 3, 4]) {
+        const candidate = residualPalette(image, width, height, filter, copies);
+        if (!candidate) continue;
+        const packed = deflateSync(candidate.raw, { level: 3, memLevel: 8 });
+        const trial = assemble(width, height, 3, packed, candidate.image.palette, candidate.image.transparency);
+        trials.push({ ...candidate, estimate: trial.length });
+      }
+    }
+    trials.sort((a, b) => a.estimate - b.estimate);
+    let contender;
+    for (const candidate of trials.slice(0, 2)) {
+      const bytes = refine(candidate.raw, candidate.image, (data) => deflateSync(data, { level: 9, memLevel: 9 }));
+      if (bytes < ranked[0].bytes * 0.998 && (!contender || bytes < contender.bytes)) contender = { ...candidate, bytes };
+    }
+    if (contender) {
+      const trialPacked = compressOptimally(contender.raw);
+      const overhead = (im) => im.palette.length + im.transparency.length + (im.transparency.length ? 12 : 0);
+      if (trialPacked && (!winner || trialPacked.length + overhead(contender.image) < winner.packed.length + overhead(image))) {
+        winner = { raw: contender.raw, packed: trialPacked };
+        outputImage = contender.image;
+      }
+    }
+  }
   if (winner) {
-    const packed = repack(winner.raw, winner.packed, width * image.channels + 1);
-    const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
+    const packed = repack(winner.raw, winner.packed, width * outputImage.channels + 1);
+    const png = assemble(width, height, outputImage.mode, packed, outputImage.palette, outputImage.transparency);
     if (png.length < result.length) result = png;
   }
   return result;

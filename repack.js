@@ -433,7 +433,59 @@ function extendMatch(raw, runs, pos, dist, known, max) {
 // Reparse several native LZ77 factorizations under the starter stream's exact
 // Huffman prices. Every old match and literal remains available. Matches found
 // by another parser can be shortened or extended anywhere they overlap a cut.
-function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStarts) {
+// Model the likely change in tree lengths when a reparsed block uses a symbol
+// more or less often. Keep some weight on this block's actual integer codes.
+// A dominant symbol occupies one branch, so condition the remaining alphabet
+// on the other branch to respect Huffman's one-bit minimum.
+function blendedPrices(frequencies, original, fallback) {
+  let total = 0, largest = 0, peak = -1;
+  for (let i = 0; i < frequencies.length; i++) {
+    const count = frequencies[i];
+    total += count;
+    if (count > largest) { largest = count; peak = i; }
+  }
+  const weights = new Uint8Array(frequencies.length);
+  for (let i = 0; i < weights.length; i++) {
+    const before = original[i] || fallback(i);
+    if (!total) { weights[i] = before * 8; continue; }
+    const count = frequencies[i] + 0.35;
+    let ideal;
+    if (largest * 2 > total) {
+      ideal = i === peak ? 1 : 1 + Math.log2((total - largest + 0.35 * (weights.length - 1)) / count);
+    } else {
+      ideal = Math.log2((total + 0.35 * weights.length) / count);
+    }
+    const bits = 0.32 * before + 0.68 * Math.min(15, Math.max(1, ideal));
+    weights[i] = Math.round(8 * bits);
+  }
+  return weights;
+}
+
+function pricesFromParse(raw, block, plan, firstMatch) {
+  const literals = new Uint32Array(286), distances = new Uint32Array(30);
+  let at = block.start, match = firstMatch;
+  while (match < plan.positions.length && plan.positions[match] < at) match++;
+  while (at < block.end) {
+    if (match < plan.positions.length && plan.positions[match] === at) {
+      const length = plan.lengths[match], distance = plan.distances[match];
+      literals[symbolForLength[length]]++;
+      distances[symbolForDistance[distance]]++;
+      match++;
+      at += length;
+    } else {
+      literals[raw[at++]]++;
+    }
+  }
+  literals[256]++;
+  return [
+    blendedPrices(literals, block.literal.lens, i => i < 256 ? 12 : 10),
+    blendedPrices(distances, block.distance.lens, () => 8),
+  ];
+}
+
+function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStarts, fractional = false) {
+  const units = fractional ? 8 : 1;
+  const lengthBits = lengthExtra.map(n => n * units), distanceBitsForSymbol = distanceExtra.map(n => n * units);
   const plans = [
     readPlan(base, raw.length, true),
     ...alternateStreams.map((x) => readPlan(x, raw.length, false)),
@@ -473,7 +525,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
     reader = new BitReader(base.subarray(2, -4));
   const streamEnds = plans.map(() => 0),
     cursors = new Int32Array(plans.length);
-  const capacity = plans.length + depthLimit + 13 + prior.rows.length;
+  const capacity = plans.length + depthLimit + 21 + prior.rows.length;
   const candidates = new Uint16Array(capacity),
     reach = new Uint16Array(capacity),
     prices = new Uint16Array(capacity);
@@ -491,27 +543,44 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
     }
     // Price unused symbols provisionally. Before emitting the chosen tokens,
     // chooseCodebook checks that every symbol has an actual output code.
-    const literalPrices = Uint8Array.from({ length: 286 }, (_, i) => literal.lens[i] || (i < 256 ? 12 : 10));
-    const distancePrices = Uint8Array.from({ length: 30 }, (_, i) => distance.lens[i] || 8);
+    const [literalPrices, distancePrices] = fractional
+      ? pricesFromParse(raw, block, plans[0], streamEnds[0])
+      : [Uint8Array.from({ length: 286 }, (_, i) => literal.lens[i] || (i < 256 ? 12 : 10)),
+         Uint8Array.from({ length: 30 }, (_, i) => distance.lens[i] || 8)];
     const minDistanceCost = new Uint8Array(31);
     minDistanceCost[30] = 255;
     for (let k = 29; k >= 0; k--) {
       const bits = distancePrices[k];
-      minDistanceCost[k] = Math.min(minDistanceCost[k + 1], bits ? bits + distanceExtra[k] : 255);
+      minDistanceCost[k] = Math.min(minDistanceCost[k + 1], bits ? bits + distanceBitsForSymbol[k] : 255);
     }
     const lenCost = new Int32Array(259);
     for (let j = 3; j <= 258; j++) {
       const sym = symbolForLength[j],
         l = literalPrices[sym];
-      lenCost[j] = l ? l + lengthExtra[sym - 257] : high;
+      lenCost[j] = l ? l + lengthBits[sym - 257] : high;
     }
+    // UI elements can recur at a useful displacement that is neither a full
+    // row nor the nearest occurrence of their first three bytes. Keep a small
+    // set of common displacements from independent parses of this block.
+    const displacementWeights = new Map();
     for (let s = 0; s < plans.length; s++) {
-      const a = plans[s].positions;
+      const plan = plans[s];
       let idx = streamEnds[s];
-      while (idx < a.length && a[idx] < end) idx++;
+      while (idx < plan.positions.length && plan.positions[idx] < end) {
+        const dist = plan.distances[idx], length = plan.lengths[idx];
+        if (dist >= 8 && length >= 5) {
+          const weight = Math.min(48, length) * (s === 0 ? 2 : 1);
+          displacementWeights.set(dist, (displacementWeights.get(dist) || 0) + weight);
+        }
+        idx++;
+      }
       streamEnds[s] = idx;
       cursors[s] = idx - 1;
     }
+    const frequent = [...displacementWeights]
+      .filter(([d, weight]) => weight >= 75 && !prior.rows.includes(d))
+      .sort((a, b) => b[1] - a[1] || a[0] - b[0]).slice(0, 8).map(([d]) => d);
+    const usefulDistances = [...prior.rows, ...frequent].sort((a, b) => a - b);
     costs[end] = 0;
     const suffixMinimum = new Int32Array(512), prefixMinimum = new Int32Array(512);
     function remember(pos) {
@@ -584,7 +653,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
           if (len < 3) continue;
           candidates[count] = dist;
           reach[count] = len;
-          prices[count++] = symbolCost + distanceExtra[distanceSymbol];
+          prices[count++] = symbolCost + distanceBitsForSymbol[distanceSymbol];
           max = Math.max(max, len);
         }
 
@@ -593,9 +662,9 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
         for (let j = 0; j < count; j++)
           if (reach[j] === limit) fullCost = Math.min(fullCost, prices[j]);
         // Aligned scanlines can be farther back than the nearest hash-chain entries.
-        for (const dist of prior.rows) {
+        for (const dist of usefulDistances) {
           if (dist > at) break;
-          const price = distancePrices[symbolForDistance[dist]] + distanceExtra[symbolForDistance[dist]];
+          const price = distancePrices[symbolForDistance[dist]] + distanceBitsForSymbol[symbolForDistance[dist]];
           if (fullCost <= price) continue;
           const from = at - dist;
           if (raw[from] !== raw[at] || raw[from + 1] !== raw[at + 1] || raw[from + 2] !== raw[at + 2]) continue;
@@ -628,7 +697,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
             break;
           }
           if (!distanceBits) continue;
-          const distancePrice = distanceBits + distanceExtra[distanceSymbol];
+          const distancePrice = distanceBits + distanceBitsForSymbol[distanceSymbol];
           let minimumLength = 2,
             alreadySeen = false;
           for (let j = 0; j < count; j++) {
@@ -1050,24 +1119,111 @@ function writeStored(writer, raw, start, end, final) {
   for (let i = start; i < end; i++) writer.write(raw[i], 8);
 }
 
+// The code that minimizes weighted payload length need not minimize a DEFLATE
+// block. Equalizing neighboring low counts can shorten the run-length-coded tree.
+function regularizedCounts(counts, softness, fillHoles) {
+  const weights = Float64Array.from(counts);
+  let last = counts.length - 1;
+  while (last > 0 && !counts[last]) last--;
+  for (let begin = 0; begin <= last;) {
+    if (!counts[begin]) { begin++; continue; }
+    let sum = counts[begin], end = begin + 1;
+    for (; end <= last; end++) {
+      const count = counts[end], average = sum / (end - begin);
+      if (!count && (!fillHoles || end === last || !counts[end + 1] || average > 2.9)) break;
+      if (Math.abs(count - average) > Math.max(softness, average * softness * 0.14)) break;
+      sum += count;
+    }
+    if (end - begin >= 3) {
+      const mean = Math.max(0.5, sum / (end - begin));
+      weights.fill(mean, begin, end);
+    }
+    begin = end;
+  }
+  return weights;
+}
+function blockBooks(counts) {
+  const out = [];
+  const signatures = new Set();
+  for (const [softness, fill, depth] of [[0, false, 15], [0, false, 11],
+      [1.0, false, 15], [2.3, true, 15], [4.0, true, 12], [7.0, true, 10]]) {
+    const freq = softness ? regularizedCounts(counts, softness, fill) : counts;
+    const lengths = optimalLengths(freq, depth);
+    const signature = Buffer.from(lengths).toString('base64');
+    if (signatures.has(signature)) continue;
+    signatures.add(signature);
+    let cost = 0;
+    for (let i = 0; i < counts.length; i++) cost += counts[i] * lengths[i];
+    out.push({ lengths, cost });
+  }
+  return out;
+}
 function tuneHeaders(raw, base) {
-  const { blocks } = readPlan(base, raw.length, true);
+  const plan = readPlan(base, raw.length, true);
   const reader = new BitReader(base.subarray(2, -4));
   const writer = new BitWriter(base.length);
-  for (const block of blocks) {
+  let match = 0;
+  for (const block of plan.blocks) {
     if (block.type === 0) {
       writeStored(writer, raw, block.start, block.end, block.final);
       continue;
     }
-    const trial = block.type === 2
-      ? encodeCodebook(block.literal.lens, block.distance.lens, block.final, true)
-      : null;
-    if (trial && trial.at < block.dataStart - block.header) {
-      writer.copy(new BitReader(trial.bytes), 0, trial.at);
-    } else {
-      writer.copy(reader, block.header, block.dataStart);
+    const firstMatch = match;
+    const lc = new Uint32Array(286), dc = new Uint32Array(30);
+    let extra = 0;
+    for (let at = block.start; at < block.end;) {
+      if (match < plan.positions.length && plan.positions[match] === at) {
+        const n = plan.lengths[match], d = plan.distances[match++];
+        const ls = symbolForLength[n], ds = symbolForDistance[d];
+        lc[ls]++; dc[ds]++; extra += lengthExtra[ls - 257] + distanceExtra[ds];
+        at += n;
+      } else lc[raw[at++]]++;
     }
-    writer.copy(reader, block.dataStart, block.dataEnd);
+    lc[256]++;
+    let original = null, best = null;
+    let bestBits = block.dataEnd - block.header;
+    if (block.type === 2) {
+      const runHeader = encodeCodebook(block.literal.lens, block.distance.lens, block.final, true);
+      const bits = runHeader.at + block.dataEnd - block.dataStart;
+      if (bits < bestBits) { original = runHeader; bestBits = bits; }
+    }
+    const finalists = [];
+    const literals = blockBooks(lc), distances = blockBooks(dc);
+    for (const l of literals) for (const d of distances) {
+      const dataBits = l.cost + d.cost + extra;
+      if (dataBits + 25 >= bestBits) continue;
+      const header = encodeCodebook(l.lengths, d.lengths, block.final);
+      const bits = dataBits + header.at;
+      if (bits < bestBits) { best = { l, d, header }; bestBits = bits; }
+      finalists.push({ l, d, dataBits, bits });
+    }
+    finalists.sort((a, b) => a.bits - b.bits);
+    for (const { l, d, dataBits } of finalists.slice(0, 2)) {
+      const header = encodeCodebook(l.lengths, d.lengths, block.final, true);
+      const bits = header.at + dataBits;
+      if (bits < bestBits) { best = { l, d, header }; bestBits = bits; }
+    }
+    if (!best) {
+      if (original) writer.copy(new BitReader(original.bytes), 0, original.at);
+      else writer.copy(reader, block.header, block.dataStart);
+      writer.copy(reader, block.dataStart, block.dataEnd);
+      continue;
+    }
+    writer.copy(new BitReader(best.header.bytes), 0, best.header.at);
+    const literal = prefixTree(best.l.lengths, false), distance = prefixTree(best.d.lengths, false);
+    let j = firstMatch;
+    for (let at = block.start; at < block.end;) {
+      if (j < match && plan.positions[j] === at) {
+        const n = plan.lengths[j], d = plan.distances[j++];
+        const ls = symbolForLength[n], ds = symbolForDistance[d];
+        printSymbol(writer, literal, ls);
+        writer.write(n - lengthBase[ls - 257], lengthExtra[ls - 257]);
+        printSymbol(writer, distance, ds);
+        writer.write(d - distanceBase[ds], distanceExtra[ds]);
+        at += n;
+      } else printSymbol(writer, literal, raw[at++]);
+    }
+    printSymbol(writer, literal, 256);
   }
   const result = Buffer.concat([
     base.subarray(0, 2),
@@ -1094,7 +1250,7 @@ export function repack(raw, packed, stride = 0) {
   const first = reprice(raw, packed, alternatives, prior, runs, large ? 52 : 80, large ? 65000 : 125000);
   const grouped = repartition(raw, first, packed.length < 180000 ? 240 : 380);
   const best = packed.length < 180000
-    ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000)
+    ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000, true)
     : grouped;
   return tuneHeaders(raw, best);
 }

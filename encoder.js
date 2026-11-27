@@ -260,6 +260,71 @@ function polishStrips(base, sources, width, height, channels, rows) {
   return result;
 }
 
+// Score alternative filter paths against a rolling DEFLATE dictionary. Two
+// different endings survive each band, so an initially costlier predictor can
+// win once the next band uses its matches. Place cuts near changes in the
+// amount of vertical detail rather than tying them to a fixed scanline grid.
+function chooseFilterPath(streams, width, height, channels, guide) {
+  const stride = width * channels + 1;
+  const detail = new Float64Array(height);
+  const up = streams[2], plain = streams[0];
+  for (let y = 0; y < height; y++) {
+    let changed = 0, edges = 0, samples = 0;
+    const at = y * stride;
+    for (let x = channels; x < stride - 1; x += 5 * channels) {
+      const pos = at + 1 + x;
+      for (let c = 0; c < channels; c++) {
+        if (up[pos + c]) changed++;
+        if (plain[pos + c] !== plain[pos + c - channels]) edges++;
+        samples++;
+      }
+    }
+    detail[y] = (changed + 0.4 * edges) / Math.max(1, samples);
+  }
+  const band = channels === 1 ? 11 : 9;
+  let paths = [{ score: 0, history: Buffer.alloc(0), previous: null, strip: null }];
+  for (let y = 0; y < height;) {
+    let stop = Math.min(height, y + band);
+    if (stop + 3 < height) {
+      let bestEdge = -Infinity;
+      for (let row = Math.max(y + 3, stop - 4); row <= Math.min(height - 1, y + band + 4); row++) {
+        const edge = Math.abs(detail[row] - detail[row - 1])
+          + 0.3 * Math.abs(detail[Math.min(height - 1, row + 1)] - detail[row - 1])
+          - 0.013 * Math.abs(row - y - band);
+        if (edge > bestEdge) { bestEdge = edge; stop = row; }
+      }
+    }
+    const start = y * stride, end = stop * stride;
+    const bands = [];
+    for (const source of [...streams, guide]) {
+      const strip = source.subarray(start, end);
+      if (!bands.some(s => s.equals(strip))) bands.push(strip);
+    }
+    const choices = [];
+    for (const previous of paths) {
+      const options = { level: 5, memLevel: 7 };
+      if (previous.history.length) options.dictionary = previous.history;
+      for (const strip of bands) {
+        const bytes = deflateRawSync(strip, options).length;
+        choices.push({ score: previous.score + bytes, previous, strip });
+      }
+    }
+    choices.sort((a, b) => a.score - b.score);
+    const first = choices[0];
+    const alternative = choices.find(p => p.strip !== first.strip);
+    paths = alternative ? [first, alternative] : [first];
+    for (const path of paths) {
+      const n = Math.max(0, 32768 - path.strip.length);
+      path.history = n === 0 ? path.strip.subarray(-32768) :
+        Buffer.concat([path.previous.history.subarray(Math.max(0, path.previous.history.length - n)), path.strip]);
+    }
+    y = stop;
+  }
+  const selected = [];
+  for (let state = paths[0]; state.previous; state = state.previous) selected.push(state.strip);
+  return Buffer.concat(selected.reverse(), stride * height);
+}
+
 export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
@@ -307,6 +372,9 @@ export function encodeScreenshot(file) {
     const rows = image.mode === 0 || image.mode === 4 ? 1 : denseRgb ? 2 : 16;
     const level = rows === 1 ? 3 : rows === 2 ? 5 : 7;
     layouts.push(chooseStrips(alternatives, width, height, image.channels, rows, 32768, level));
+  }
+  if (image.channels === 1 || strongest.png.length < width * height * 0.09) {
+    layouts.push(chooseFilterPath(alternatives, width, height, image.channels, wide));
   }
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
   const ranked = distinct.map(raw => ({

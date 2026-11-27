@@ -1,4 +1,6 @@
-import { crc32, deflateSync, inflateSync } from 'node:zlib';
+import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
+
+import { compressOptimally } from './optimal.js';
 
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -181,29 +183,54 @@ function filteredImages(image, width, height) {
   return streams;
 }
 
-function bestCompression(image, w, h, effort) {
+function candidatesFor(image, w, h, effort) {
   const streams = filteredImages(image, w, h);
-  const order = streams.map((s, index) => ({
-    index, bytes: deflateSync(s, { level: 3, memLevel: 9 }).length,
+  const order = streams.map((raw, index) => ({
+    index, bytes: deflateSync(raw, { level: 3, memLevel: 9 }).length,
   })).sort((a, b) => a.bytes - b.bytes);
-  const candidates = new Set(order.slice(0, effort).map(s => s.index));
-  // The fixed Paeth predictor is an inexpensive reference for rich-colour images.
-  if (image.mode === 6 || image.mode === 2) candidates.add(4);
-  let best;
-  for (const i of candidates) {
-    const result = deflateSync(streams[i], { level: 9, memLevel: 9 });
-    if (!best || result.length < best.length) best = result;
+  const indices = new Set(order.slice(0, effort).map(candidate => candidate.index));
+  if (image.mode === 2 || image.mode === 6) indices.add(4);
+  const candidates = [];
+  for (const index of indices) {
+    const raw = streams[index];
+    const packed = deflateSync(raw, { level: 9, memLevel: 8 });
+    const png = assemble(w, h, image.mode, packed, image.palette, image.transparency);
+    candidates.push({ png, raw, image, index });
   }
-  return assemble(w, h, image.mode, best, image.palette, image.transparency);
+  return candidates;
+}
+
+// Compare complete strips against the same prefix dictionary. Fixed Paeth, for
+// example, can work well across a soft shadow and poorly in a table of flat fills.
+// Previous choices become the dictionary for the next group of rows.
+function chooseStrips(streams, w, h, channels, stripHeight) {
+  const stride = w * channels + 1;
+  const selected = Buffer.allocUnsafe(stride * h);
+  for (let y = 0; y < h; y += stripHeight) {
+    const start = y * stride;
+    const end = Math.min(h, y + stripHeight) * stride;
+    const options = { level: 5, memLevel: 7 };
+    if (start) options.dictionary = selected.subarray(Math.max(0, start - 32768), start);
+    let best = null, bestSize = Infinity;
+    for (const stream of streams) {
+      const strip = stream.subarray(start, end);
+      const size = deflateRawSync(strip, options).length;
+      if (size < bestSize) {
+        best = strip;
+        bestSize = size;
+      }
+    }
+    best.copy(selected, start);
+  }
+  return selected;
 }
 
 export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
   const { counts, indexed, gray, opaque } = inspectColors(pixels);
-  let smallest;
+  const candidates = [];
   function compare(image, effort = 3) {
-    const bytes = bestCompression(image, width, height, effort);
-    if (!smallest || bytes.length < smallest.length) smallest = bytes;
+    candidates.push(...candidatesFor(image, width, height, effort));
   }
   if (gray) compare(directImage(pixels, opaque ? 0 : 4), 4);
   if (indexed) {
@@ -216,5 +243,18 @@ export function encodeScreenshot(file) {
     if (frequent.some((c,i) => c !== colors[i])) compare(paletteImage(pixels, frequent));
   }
   if (!gray) compare(directImage(pixels, opaque ? 2 : 6), 4);
-  return smallest;
+  candidates.sort((a,b) => a.png.length - b.png.length);
+  const strongest = candidates[0];
+  let result = strongest.png;
+  function refine(raw, image) {
+    const packed = compressOptimally(raw);
+    if (!packed) return;
+    const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
+    if (png.length < result.length) result = png;
+  }
+  refine(strongest.raw, strongest.image);
+  const alternatives = filteredImages(strongest.image, width, height);
+  const strips = chooseStrips(alternatives, width, height, strongest.image.channels, 8);
+  if (!strips.equals(strongest.raw)) refine(strips, strongest.image);
+  return result;
 }

@@ -267,6 +267,15 @@ export function encodeScreenshot(file) {
   const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
   const narrow = chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3);
   const layouts = [strongest.raw, wide, narrow];
+  // A long strip keeps one predictor across repeated shapes. Dense RGB data
+  // changes faster, so compare shorter strips against the full 32 KiB history.
+  // Grayscale samples can switch predictors on each row at lower search cost.
+  if (image.mode !== 3) {
+    const denseRgb = image.mode === 2 && strongest.png.length > width * height * 0.30;
+    const rows = image.mode === 0 || image.mode === 4 ? 1 : denseRgb ? 2 : 16;
+    const level = rows === 1 ? 3 : rows === 2 ? 5 : 7;
+    layouts.push(chooseStrips(alternatives, width, height, image.channels, rows, 32768, level));
+  }
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
   let bestRaw = distinct[0], bestSize = Infinity;
   for (const raw of distinct) {

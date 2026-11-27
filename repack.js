@@ -433,7 +433,59 @@ function extendMatch(raw, runs, pos, dist, known, max) {
 // Reparse several native LZ77 factorizations under the starter stream's exact
 // Huffman prices. Every old match and literal remains available. Matches found
 // by another parser can be shortened or extended anywhere they overlap a cut.
-function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStarts) {
+// Model the likely change in tree lengths when a reparsed block uses a symbol
+// more or less often. Keep some weight on this block's actual integer codes.
+// A dominant symbol occupies one branch, so condition the remaining alphabet
+// on the other branch to respect Huffman's one-bit minimum.
+function blendedPrices(frequencies, original, fallback) {
+  let total = 0, largest = 0, peak = -1;
+  for (let i = 0; i < frequencies.length; i++) {
+    const count = frequencies[i];
+    total += count;
+    if (count > largest) { largest = count; peak = i; }
+  }
+  const weights = new Uint8Array(frequencies.length);
+  for (let i = 0; i < weights.length; i++) {
+    const before = original[i] || fallback(i);
+    if (!total) { weights[i] = before * 8; continue; }
+    const count = frequencies[i] + 0.35;
+    let ideal;
+    if (largest * 2 > total) {
+      ideal = i === peak ? 1 : 1 + Math.log2((total - largest + 0.35 * (weights.length - 1)) / count);
+    } else {
+      ideal = Math.log2((total + 0.35 * weights.length) / count);
+    }
+    const bits = 0.32 * before + 0.68 * Math.min(15, Math.max(1, ideal));
+    weights[i] = Math.round(8 * bits);
+  }
+  return weights;
+}
+
+function pricesFromParse(raw, block, plan, firstMatch) {
+  const literals = new Uint32Array(286), distances = new Uint32Array(30);
+  let at = block.start, match = firstMatch;
+  while (match < plan.positions.length && plan.positions[match] < at) match++;
+  while (at < block.end) {
+    if (match < plan.positions.length && plan.positions[match] === at) {
+      const length = plan.lengths[match], distance = plan.distances[match];
+      literals[symbolForLength[length]]++;
+      distances[symbolForDistance[distance]]++;
+      match++;
+      at += length;
+    } else {
+      literals[raw[at++]]++;
+    }
+  }
+  literals[256]++;
+  return [
+    blendedPrices(literals, block.literal.lens, i => i < 256 ? 12 : 10),
+    blendedPrices(distances, block.distance.lens, () => 8),
+  ];
+}
+
+function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStarts, fractional = false) {
+  const units = fractional ? 8 : 1;
+  const lengthBits = lengthExtra.map(n => n * units), distanceBitsForSymbol = distanceExtra.map(n => n * units);
   const plans = [
     readPlan(base, raw.length, true),
     ...alternateStreams.map((x) => readPlan(x, raw.length, false)),
@@ -491,19 +543,21 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
     }
     // Price unused symbols provisionally. Before emitting the chosen tokens,
     // chooseCodebook checks that every symbol has an actual output code.
-    const literalPrices = Uint8Array.from({ length: 286 }, (_, i) => literal.lens[i] || (i < 256 ? 12 : 10));
-    const distancePrices = Uint8Array.from({ length: 30 }, (_, i) => distance.lens[i] || 8);
+    const [literalPrices, distancePrices] = fractional
+      ? pricesFromParse(raw, block, plans[0], streamEnds[0])
+      : [Uint8Array.from({ length: 286 }, (_, i) => literal.lens[i] || (i < 256 ? 12 : 10)),
+         Uint8Array.from({ length: 30 }, (_, i) => distance.lens[i] || 8)];
     const minDistanceCost = new Uint8Array(31);
     minDistanceCost[30] = 255;
     for (let k = 29; k >= 0; k--) {
       const bits = distancePrices[k];
-      minDistanceCost[k] = Math.min(minDistanceCost[k + 1], bits ? bits + distanceExtra[k] : 255);
+      minDistanceCost[k] = Math.min(minDistanceCost[k + 1], bits ? bits + distanceBitsForSymbol[k] : 255);
     }
     const lenCost = new Int32Array(259);
     for (let j = 3; j <= 258; j++) {
       const sym = symbolForLength[j],
         l = literalPrices[sym];
-      lenCost[j] = l ? l + lengthExtra[sym - 257] : high;
+      lenCost[j] = l ? l + lengthBits[sym - 257] : high;
     }
     for (let s = 0; s < plans.length; s++) {
       const a = plans[s].positions;
@@ -584,7 +638,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
           if (len < 3) continue;
           candidates[count] = dist;
           reach[count] = len;
-          prices[count++] = symbolCost + distanceExtra[distanceSymbol];
+          prices[count++] = symbolCost + distanceBitsForSymbol[distanceSymbol];
           max = Math.max(max, len);
         }
 
@@ -595,7 +649,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
         // Aligned scanlines can be farther back than the nearest hash-chain entries.
         for (const dist of prior.rows) {
           if (dist > at) break;
-          const price = distancePrices[symbolForDistance[dist]] + distanceExtra[symbolForDistance[dist]];
+          const price = distancePrices[symbolForDistance[dist]] + distanceBitsForSymbol[symbolForDistance[dist]];
           if (fullCost <= price) continue;
           const from = at - dist;
           if (raw[from] !== raw[at] || raw[from + 1] !== raw[at + 1] || raw[from + 2] !== raw[at + 2]) continue;
@@ -628,7 +682,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
             break;
           }
           if (!distanceBits) continue;
-          const distancePrice = distanceBits + distanceExtra[distanceSymbol];
+          const distancePrice = distanceBits + distanceBitsForSymbol[distanceSymbol];
           let minimumLength = 2,
             alreadySeen = false;
           for (let j = 0; j < count; j++) {
@@ -1181,7 +1235,7 @@ export function repack(raw, packed, stride = 0) {
   const first = reprice(raw, packed, alternatives, prior, runs, large ? 52 : 80, large ? 65000 : 125000);
   const grouped = repartition(raw, first, packed.length < 180000 ? 240 : 380);
   const best = packed.length < 180000
-    ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000)
+    ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000, true)
     : grouped;
   return tuneHeaders(raw, best);
 }

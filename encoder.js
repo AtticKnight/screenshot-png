@@ -203,14 +203,14 @@ function candidatesFor(image, w, h, effort) {
 // Compare complete strips against the same prefix dictionary. Fixed Paeth, for
 // example, can work well across a soft shadow and poorly in a table of flat fills.
 // Previous choices become the dictionary for the next group of rows.
-function chooseStrips(streams, w, h, channels, stripHeight) {
+function chooseStrips(streams, w, h, channels, stripHeight, history, level) {
   const stride = w * channels + 1;
   const selected = Buffer.allocUnsafe(stride * h);
   for (let y = 0; y < h; y += stripHeight) {
     const start = y * stride;
     const end = Math.min(h, y + stripHeight) * stride;
-    const options = { level: 5, memLevel: 7 };
-    if (start) options.dictionary = selected.subarray(Math.max(0, start - 32768), start);
+    const options = { level, memLevel: 7 };
+    if (start) options.dictionary = selected.subarray(Math.max(0, start - history), start);
     let best = null, bestSize = Infinity;
     for (const stream of streams) {
       const strip = stream.subarray(start, end);
@@ -252,9 +252,16 @@ export function encodeScreenshot(file) {
     const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
     if (png.length < result.length) result = png;
   }
-  refine(strongest.raw, strongest.image);
-  const alternatives = filteredImages(strongest.image, width, height);
-  const strips = chooseStrips(alternatives, width, height, strongest.image.channels, 8);
-  if (!strips.equals(strongest.raw)) refine(strips, strongest.image);
+  const image = strongest.image;
+  const alternatives = filteredImages(image, width, height);
+  const wide = chooseStrips(alternatives, width, height, image.channels, 8, 32768, 5);
+  const narrow = chooseStrips(alternatives, width, height, image.channels, 2, 3 * (width * image.channels + 1), 3);
+  // The quick compressor selects two expensive refinements from the three
+  // independent layouts. It ranks complete rows, including their filter tags.
+  const layouts = [strongest.raw, wide, narrow];
+  const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
+  const ranked = distinct.map(raw => ({ raw, size: deflateSync(raw, {level:9}).length }))
+    .sort((a, b) => a.size - b.size);
+  for (const candidate of ranked.slice(0, 2)) refine(candidate.raw, image);
   return result;
 }

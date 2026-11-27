@@ -53,3 +53,20 @@ edit("squeeze.c","costmodel(in[i], 0, costcontext) + costs[j]","literals[in[i]] 
 edit("squeeze.c","costmodel(k, sublen[k], costcontext) + costs[j]","pairs[distance_class[sublen[k]]][k] + costs[j]")
 edit("squeeze.c","double symbolcost = costmodel(ZOPFLI_MAX_MATCH, 1, costcontext);",
      "double symbolcost = pairs[0][ZOPFLI_MAX_MATCH];")
+
+# A run of equal length/distance symbol prices is one double. Share that price
+# across its destinations; keep the scalar comparison's rounding and order.
+(root / "screenshot-relax.h").write_text(
+    Path(__file__).with_name("zopfli-relax.h").read_text()
+)
+path = root / "squeeze.c"
+path.write_text('#include "screenshot-relax.h"\n' + path.read_text())
+edit("squeeze.c", "  double mincost = GetCostModelMinCost(costmodel, costcontext);", "")
+edit("squeeze.c", "  double mincostaddcostj;", """  static unsigned short length_end[ZOPFLI_MAX_MATCH + 1];
+  if (!length_end[3]) {
+    for (unsigned l = ZOPFLI_MAX_MATCH; l >= 3; --l) {
+      length_end[l] = (l < ZOPFLI_MAX_MATCH &&
+          ZopfliGetLengthSymbol(l) == ZopfliGetLengthSymbol(l+1)) ? length_end[l+1] : l;
+    }
+  }""")
+edit("squeeze.c", "    mincostaddcostj = mincost + costs[j];\n    for (k = 3; k <= kend; k++) {\n      double newCost;\n\n      /* Calling the cost model is expensive, avoid this if we are already at\n      the minimum possible cost that it can return. */\n     if (costs[j + k] <= mincostaddcostj) continue;\n\n      newCost = pairs[distance_class[sublen[k]]][k] + costs[j];\n      assert(newCost >= 0);\n      if (newCost < costs[j + k]) {\n        assert(k <= ZOPFLI_MAX_MATCH);\n        costs[j + k] = newCost;\n        length_array[j + k] = k;\n      }\n    }", "    /* Longer matches require searching at least as far along the hash chain.\n       Symbol costs remain constant across each length and distance interval. */\n    for (k = 3; k <= kend; ) {\n      size_t last = length_end[k] < kend ? length_end[k] : kend;\n      unsigned dc = distance_class[sublen[k]];\n      if (distance_class[sublen[last]] != dc) {\n        size_t low = k, high = last;\n        while (low + 1 < high) {\n          size_t mid = (low + high) / 2;\n          if (distance_class[sublen[mid]] == dc) low = mid;\n          else high = mid;\n        }\n        last = low;\n      }\n      relax_length_span(costs+j,length_array+j,k,last,pairs[dc][k]+costs[j]);\n      k = last + 1;\n    }")

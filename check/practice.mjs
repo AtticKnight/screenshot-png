@@ -7,10 +7,11 @@ import { decodePng } from './kit/program/scorer/checker/png.mjs';
 import { points } from './kit/program/scorer/checker/check.mjs';
 
 const kit = resolve('check/kit');
-const input = join(kit, 'practice/input');
+const dataset = process.argv[2] ? resolve(process.argv[2]) : join(kit, 'practice');
+const input = join(dataset,'input');
 const names = readdirSync(input).sort();
 assert.equal(names.length, 8);
-const manifest = JSON.parse(readFileSync(join(kit, 'practice/reference/manifest.json'), 'utf8'));
+const manifest = JSON.parse(readFileSync(join(dataset, 'reference/manifest.json'), 'utf8'));
 console.log('Reference manifest preview', JSON.stringify(manifest).slice(0, 730));
 
 function execute(entry, dest) {

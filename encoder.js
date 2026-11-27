@@ -271,6 +271,6 @@ export function encodeScreenshot(file) {
   // The entropy-model pass spends most of its time parsing the remaining tokens.
   // On large residual streams use the already measured near-optimal parse.
   // This fixed input-derived budget applies identically across all screenshots.
-  if (bestSize <= 128 * 1024) refine(bestRaw, image, compressWithZopfli);
+  if (bestSize <= 128 * 1024) refine(bestRaw, image, raw => compressWithZopfli(raw, bestSize < 49152 ? 5 : 3));
   return result;
 }

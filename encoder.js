@@ -1,7 +1,5 @@
 import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
 
-import { compressOptimally } from './optimal.js';
-import { compressWithZopfli } from './zopfli.js';
 
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -279,12 +277,13 @@ export function encodeScreenshot(file) {
   const distinct = layouts.filter((raw, i) => layouts.slice(0, i).every(previous => !raw.equals(previous)));
   let bestRaw = distinct[0], bestSize = Infinity;
   for (const raw of distinct) {
-    const size = refine(raw, image, compressOptimally);
+    const size = refine(raw, image, data => deflateSync(data, { level: 9, memLevel: 9 }));
     if (size < bestSize) { bestSize = size; bestRaw = raw; }
   }
-  // The entropy-model pass spends most of its time parsing the remaining tokens.
-  // On large residual streams use the already measured near-optimal parse.
-  // This fixed input-derived budget applies identically across all screenshots.
-  if (bestSize <= 128 * 1024) refine(bestRaw, image, raw => compressWithZopfli(raw, bestSize < 49152 ? 4 : 2));
+  // zlib's block boundaries depend on its token buffer. Different limits
+  // trade header overhead against how closely codes follow the current rows.
+  for (const memLevel of [6, 8]) {
+    refine(bestRaw, image, data => deflateSync(data, { level: 9, memLevel }));
+  }
   return result;
 }

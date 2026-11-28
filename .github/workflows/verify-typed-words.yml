@@ -1,0 +1,46 @@
+name: Validate unaligned word loads in the PNG compressor
+on:
+  push:
+    branches: [bench/typed-word-loads]
+permissions:
+  contents: read
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - name: Rebuild the JavaScript optimization and compare exact deflate output
+        run: |
+          cp vendor/libdeflate.js vendor/libdeflate-unchanged.js
+          node build/optimize-loads.mjs vendor/libdeflate.js
+          node --no-expose-wasm check/word-loads.mjs
+      - run: python3 check/fetch.py
+      - name: Check eight practice screenshots twice on one CPU
+        run: |
+          python3 -c 'import os;os.sched_setaffinity(0,{min(os.sched_getaffinity(0))});os.execvp("node",["node","check/practice.mjs"])'
+  unseen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - run: node build/optimize-loads.mjs vendor/libdeflate.js
+      - run: python3 check/fetch.py
+      - name: Draw fresh screenshot sets and check every channel twice on one CPU
+        run: |
+          mkdir -p check/benchmark-seed
+          for seed in four five; do
+            DRAW_NAME="$seed" node -e 'const fs=require("node:fs"),crypto=require("node:crypto"); fs.writeFileSync("check/benchmark-seed/seed.json",JSON.stringify({schema:"agent-fun/instance-seed/v1",seed:crypto.createHash("sha256").update("AtticKnight independent public PNG validation, draw "+process.env.DRAW_NAME).digest("hex")}))'
+            MAKEFUN_INPUT_DIR="$PWD/check/benchmark-seed" MAKEFUN_OUTPUT_DIR="$PWD/check/benchmark-$seed" node check/kit/program/generator/draw.ts
+            python3 -c 'import os,sys;os.sched_setaffinity(0,{min(os.sched_getaffinity(0))});os.execvp("node",["node","check/practice.mjs",sys.argv[1]])' "check/benchmark-$seed"
+          done

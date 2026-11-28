@@ -1,7 +1,7 @@
-name: Verify screenshot compression
+name: Time bounded block reparsing
 on:
   push:
-    branches: [bench-screen-row-match-index]
+    branches: [bench/bounded-block-matches]
 permissions:
   contents: read
 jobs:
@@ -34,6 +34,8 @@ jobs:
           }
           console.log('JavaScript round trips with WebAssembly unavailable', samples);
           JS
+      - name: Compare unaligned match lengths with a byte oracle
+        run: node check/matches.mjs
       - name: Check recompression of stored, fixed and dynamic DEFLATE streams
         run: node --no-expose-wasm check/repack.mjs
       - name: Read the published practice data and checker
@@ -91,7 +93,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/competition" "$RUNNER_TEMP/entry"
           python3 - <<'PY'
-          import hashlib, os, tarfile
+          import hashlib, json, os, tarfile
           from pathlib import Path, PurePosixPath
           from urllib.request import Request, urlopen
           from shutil import copyfileobj
@@ -107,7 +109,15 @@ jobs:
                   with path.open('wb') as dest:
                       copyfileobj(archive.extractfile(item), dest)
           cli = root / 'cli' / 'makefun.mjs'
-          assert hashlib.sha256(cli.read_bytes()).hexdigest() == 'c55cf087b775bbaeecc4369155853521db45b8500eb4355eeaae143e7b05c03c'
+          manifest_url = 'https://make.fun/api/competitions/png-squeeze-01-run-20261127/kit'
+          with urlopen(Request(manifest_url, headers={'User-Agent': 'AtticKnight public practice validation'}), timeout=40) as response:
+              manifest = json.load(response)
+          [entry] = [f for f in manifest['files'] if f['path'] == 'cli/makefun.mjs']
+          assert cli.stat().st_size == entry['size']
+          with cli.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          assert digest == entry['sha256'], 'CLI differs from the separately published kit manifest'
+          print('Verified official CLI', digest)
           PY
           git archive HEAD -- LICENSE README.md encoder.js main.ts optimal.js package.json repack.js vendor | tar -x -C "$RUNNER_TEMP/entry"
       - name: Run the sponsor's Docker grading command

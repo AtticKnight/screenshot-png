@@ -468,13 +468,13 @@ export function encodeScreenshot(file) {
       const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
       if (png.length < result.length) result = png;
     };
-    finish(winner.raw, winner.packed);
-    // A smaller zlib preview can lose after optimal parsing and block splitting.
-    // Preserve the fully optimized incumbent and compare actual output bytes.
     if (extraLayout && !extraLayout.equals(winner.raw)) {
       const alternative = compressOptimally(extraLayout);
-      if (alternative && alternative.length < winner.packed.length) finish(extraLayout, alternative);
+      if (alternative && alternative.length < winner.packed.length) {
+        winner = { raw: extraLayout, packed: alternative };
+      }
     }
+    finish(winner.raw, winner.packed);
   }
   return result;
 }

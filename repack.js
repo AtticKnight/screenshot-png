@@ -443,21 +443,21 @@ function printSymbol(writer, tree, s) {
   if (!n) throw Error('Absent symbol in chosen block.');
   writer.write(tree.reverse[s], n);
 }
-function extendMatch(raw, runs, pos, dist, known, max) {
-  let z = known;
-  if (runs[pos] > z && raw[pos] === raw[pos - dist]) {
-    z = Math.max(z, Math.min(max, runs[pos], runs[pos - dist]));
+export function extendMatch(raw, words, runs, pos, dist, known, max) {
+  let n = known;
+  if (runs[pos] > n && raw[pos] === raw[pos - dist]) {
+    n = Math.max(n, Math.min(max, runs[pos], runs[pos - dist]));
   }
-  while (
-    z + 4 <= max &&
-    raw[pos + z] === raw[pos + z - dist] &&
-    raw[pos + z + 1] === raw[pos + z + 1 - dist] &&
-    raw[pos + z + 2] === raw[pos + z + 2 - dist] &&
-    raw[pos + z + 3] === raw[pos + z + 3 - dist]
-  )
-    z += 4;
-  while (z < max && raw[pos + z] === raw[pos + z - dist]) z++;
-  return z;
+  if (n === max || raw[pos + n] !== raw[pos + n - dist]) return n;
+  // Big-endian words place the first differing byte at the most significant end.
+  const source = pos - dist;
+  while (n + 4 <= max) {
+    const different = words.getUint32(pos + n) ^ words.getUint32(source + n);
+    if (different) return n + (Math.clz32(different) >>> 3);
+    n += 4;
+  }
+  while (n < max && raw[pos + n] === raw[source + n]) n++;
+  return n;
 }
 // Reparse several native LZ77 factorizations under the starter stream's exact
 // Huffman prices. Every old match and literal remains available. Matches found
@@ -512,7 +512,8 @@ function pricesFromParse(raw, block, plan, firstMatch) {
   ];
 }
 
-function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStarts, fractional = false) {
+function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStarts, fractional = false, selected = null) {
+  const words = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
   const units = fractional ? 8 : 1;
   const lengthBits = lengthExtra.map(n => n * units), distanceBitsForSymbol = distanceExtra.map(n => n * units);
   const plans = [
@@ -530,7 +531,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
       if (end > 4) events[end - 4] = 1;
     }
   }
-  if (base.length < 85000 && raw.length <= 1400000 && extraStarts) {
+  if (base.length < 85000 && raw.length <= extraStarts * 2 && extraStarts) {
     for (let i = 1; i + 2 < raw.length; i++) {
       if (raw[i - 1] !== raw[i] || runs[i] <= 3 || (i & 31) === 0) events[i] = 1;
     }
@@ -568,6 +569,14 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
     probesLeft += Math.ceil(probeBudget * (end - start) / raw.length);
     if (type === 0) {
       writeStored(writer, raw, start, end, final);
+      continue;
+    }
+    if (selected && !selected.has(start)) {
+      writer.copy(reader, block.header, block.dataEnd);
+      for (let i = 0; i < plans.length; i++) {
+        const positions = plans[i].positions;
+        while (streamEnds[i] < positions.length && positions[streamEnds[i]] < end) streamEnds[i]++;
+      }
       continue;
     }
     // Price unused symbols provisionally. Before emitting the chosen tokens,
@@ -678,7 +687,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
             }
           if (alreadySeen) continue;
           const limit = Math.min(258, end - at);
-          const len = extendMatch(raw, runs, at, dist, Math.min(remaining, limit), limit);
+          const len = extendMatch(raw, words, runs, at, dist, Math.min(remaining, limit), limit);
           if (len < 3) continue;
           candidates[count] = dist;
           reach[count] = len;
@@ -703,7 +712,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
             if (prices[j] <= price && reach[j] > need) need = reach[j];
           }
           if (need >= limit || raw[from + need] !== raw[at + need]) continue;
-          const len = extendMatch(raw, runs, at, dist, 3, limit);
+          const len = extendMatch(raw, words, runs, at, dist, 3, limit);
           if (len <= need) continue;
           candidates[count] = dist; reach[count] = len; prices[count++] = price;
           max = Math.max(max, len);
@@ -745,7 +754,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
             raw[last + 2] !== raw[at + 2]
           )
             continue;
-          const n = extendMatch(raw, runs, at, dist, 3, limit);
+          const n = extendMatch(raw, words, runs, at, dist, 3, limit);
           if (n <= minimumLength) continue;
           candidates[count] = dist;
           reach[count] = n;
@@ -1348,9 +1357,76 @@ function splitDenseBlocks(raw, base) {
   return compressed.length < base.length ? compressed : base;
 }
 
+// Dense images can still have a few text or flat-color sections. Reparse a
+// bounded selection of whole DEFLATE blocks and retain the other original bits.
+function localDenseParse(raw, packed, stride) {
+  const plan = readPlan(packed, raw.length, true);
+  const candidates = [];
+  for (const block of plan.blocks) {
+    const length = block.end - block.start;
+    const bytes = (block.dataEnd - block.header) / 8;
+    const density = bytes / length;
+    if (block.type === 0 || length < 5000 || length > 300000 ||
+        density < 0.012 || density > 0.84) continue;
+    const merit = Math.sqrt(length) * (1 - density) * Math.min(1, density * 8);
+    candidates.push({ start: block.start, length, merit });
+  }
+  candidates.sort((a, b) => b.merit - a.merit || a.start - b.start);
+  let budget = 310000;
+  const selected = new Set();
+  for (const block of candidates) {
+    if (selected.size >= 6 || block.length > budget) continue;
+    budget -= block.length;
+    selected.add(block.start);
+  }
+  if (!selected.size) return packed;
+  const runs = new Uint16Array(raw.length);
+  for (let i = raw.length - 1; i >= 0; i--) {
+    runs[i] = raw[i] === raw[i + 1] ? Math.min(258, runs[i + 1] + 1) : 1;
+  }
+  const prior = priorOccurrences(raw, runs, stride);
+  const alternatives = [deflateSync(raw, { level: 3, memLevel: 8 })];
+  return reprice(raw, packed, alternatives, prior, runs, 36, 0, true, selected);
+}
+// The second token search can revisit millions of raw positions. Give large
+// images a fixed work allowance shared by their blocks. A block with more
+// matches from different distances has more ways to improve its earlier parse.
+function selectRefinementBlocks(raw, packed) {
+  if (raw.length <= 1700000) return null;
+  const plan = readPlan(packed, raw.length, true);
+  const options = [];
+  let cursor = 0;
+  for (const block of plan.blocks) {
+    const begin = cursor;
+    const distances = new Set();
+    while (cursor < plan.positions.length && plan.positions[cursor] < block.end) {
+      distances.add(symbolForDistance[plan.distances[cursor]]);
+      cursor++;
+    }
+    if (block.type === 0 || cursor === begin) continue;
+    const length = block.end - block.start;
+    const diversity = Math.min(1, distances.size / 18);
+    const density = (cursor - begin) / length;
+    const priority = (0.35 + diversity) * Math.min(0.35, density + 0.01);
+    options.push({ start: block.start, length, priority });
+  }
+  options.sort((a, b) => b.priority - a.priority || a.start - b.start);
+  let remaining = Math.min(2300000, Math.floor(raw.length * 0.68));
+  const selected = new Set();
+  for (const option of options) {
+    if (option.length > remaining) continue;
+    selected.add(option.start);
+    remaining -= option.length;
+  }
+  return selected;
+}
+
 export function repack(raw, packed, stride = 0) {
-  if (packed.length > 245000) return splitDenseBlocks(raw, tuneHeaders(raw, packed));
-  if (packed.length > 175000) return tuneHeaders(raw, repartition(raw, packed, 460));
+  if (packed.length > 175000) {
+    const localized = localDenseParse(raw, packed, stride);
+    return packed.length > 245000 ? splitDenseBlocks(raw, tuneHeaders(raw, localized))
+      : tuneHeaders(raw, repartition(raw, localized, 460));
+  }
   const alternatives = [
     deflateSync(raw, { level: 1, memLevel: 9 }),
     deflateSync(raw, { level: 5, memLevel: 8 }),
@@ -1364,8 +1440,9 @@ export function repack(raw, packed, stride = 0) {
   const large = raw.length > 1400000;
   const first = reprice(raw, packed, alternatives, prior, runs, large ? 52 : 80, large ? 65000 : 125000);
   const grouped = repartition(raw, first, packed.length < 180000 ? 240 : 380);
-  const best = packed.length < 180000
-    ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000, true)
+  const blocks = selectRefinementBlocks(raw, grouped);
+  const best = !blocks || blocks.size
+    ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000, true, blocks)
     : grouped;
   const tuned = tuneHeaders(raw, best);
   // The fractional parse changes token counts and the best places to switch

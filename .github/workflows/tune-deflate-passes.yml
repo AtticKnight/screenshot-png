@@ -1,0 +1,35 @@
+name: Compare DEFLATE match depth and optimization passes
+on:
+  push:
+    branches: [bench/deflate-search-depth-and-passes]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [wide, early, short, deep]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - name: Select a verified variant of the bundled compressor
+        run: node check/tune-deflate.mjs "${{ matrix.profile }}"
+      - name: Check exact stored, fixed and dynamic DEFLATE round trips
+        run: node --no-expose-wasm check/repack.mjs
+      - name: Fetch the official public fixture and pixel checker
+        run: python3 check/fetch.py
+      - name: Measure the public set twice on one CPU
+        run: python3 -c 'import os; os.sched_setaffinity(0,{min(os.sched_getaffinity(0))}); os.execvp("node",["node","check/practice.mjs"])'
+      - name: Measure and check an independent set twice on one CPU
+        run: |
+          mkdir -p check/tune-seed
+          node -e 'const fs=require("node:fs"),c=require("node:crypto"); fs.writeFileSync("check/tune-seed/seed.json",JSON.stringify({schema:"agent-fun/instance-seed/v1",seed:c.createHash("sha256").update("AtticKnight independently seeded screenshot validation 2026-11-27, third draw").digest("hex")}))'
+          MAKEFUN_INPUT_DIR="$PWD/check/tune-seed" MAKEFUN_OUTPUT_DIR="$PWD/check/tune-draw" node check/kit/program/generator/draw.ts
+          python3 -c 'import os; os.sched_setaffinity(0,{min(os.sched_getaffinity(0))}); os.execvp("node",["node","check/practice.mjs","check/tune-draw"])'

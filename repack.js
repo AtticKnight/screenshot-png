@@ -1388,6 +1388,39 @@ function localDenseParse(raw, packed, stride) {
   const alternatives = [deflateSync(raw, { level: 3, memLevel: 8 })];
   return reprice(raw, packed, alternatives, prior, runs, 36, 0, true, selected);
 }
+// The second token search can revisit millions of raw positions. Give large
+// images a fixed work allowance shared by their blocks. A block with more
+// matches from different distances has more ways to improve its earlier parse.
+function selectRefinementBlocks(raw, packed) {
+  if (raw.length <= 1700000) return null;
+  const plan = readPlan(packed, raw.length, true);
+  const options = [];
+  let cursor = 0;
+  for (const block of plan.blocks) {
+    const begin = cursor;
+    const distances = new Set();
+    while (cursor < plan.positions.length && plan.positions[cursor] < block.end) {
+      distances.add(symbolForDistance[plan.distances[cursor]]);
+      cursor++;
+    }
+    if (block.type === 0 || cursor === begin) continue;
+    const length = block.end - block.start;
+    const diversity = Math.min(1, distances.size / 18);
+    const density = (cursor - begin) / length;
+    const priority = (0.35 + diversity) * Math.min(0.35, density + 0.01);
+    options.push({ start: block.start, length, priority });
+  }
+  options.sort((a, b) => b.priority - a.priority || a.start - b.start);
+  let remaining = Math.min(2300000, Math.floor(raw.length * 0.68));
+  const selected = new Set();
+  for (const option of options) {
+    if (option.length > remaining) continue;
+    selected.add(option.start);
+    remaining -= option.length;
+  }
+  return selected;
+}
+
 export function repack(raw, packed, stride = 0) {
   if (packed.length > 175000) {
     const localized = localDenseParse(raw, packed, stride);
@@ -1407,8 +1440,9 @@ export function repack(raw, packed, stride = 0) {
   const large = raw.length > 1400000;
   const first = reprice(raw, packed, alternatives, prior, runs, large ? 52 : 80, large ? 65000 : 125000);
   const grouped = repartition(raw, first, packed.length < 180000 ? 240 : 380);
-  const best = packed.length < 180000
-    ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000, true)
+  const blocks = selectRefinementBlocks(raw, grouped);
+  const best = !blocks || blocks.size
+    ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000, true, blocks)
     : grouped;
   const tuned = tuneHeaders(raw, best);
   // The fractional parse changes token counts and the best places to switch

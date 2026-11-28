@@ -456,25 +456,15 @@ export function encodeScreenshot(file) {
       if (bytes + Math.max(4, start.bytes * 0.0002) < start.bytes) extraLayout = adjusted;
     }
   }
-  let winner;
-  for (const { raw } of finalists.filter(layout => layout.bytes <= bestSize * 1.02).slice(0, limit)) {
-    const packed = compressOptimally(raw);
-    if (packed && (!winner || packed.length < winner.packed.length)) winner = { raw, packed };
-  }
-  if (winner) {
+  // Previewed layouts use the same level-9 scorer above. Only one complete
+  // libdeflate search runs per image, even when several previews are close.
+  const winner = extraLayout || finalists[0].raw;
+  const compressed = compressOptimally(winner);
+  if (compressed) {
     const rowBytes = width * image.channels + 1;
-    const finish = (raw, compressed) => {
-      const packed = repack(raw, compressed, rowBytes);
-      const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
-      if (png.length < result.length) result = png;
-    };
-    if (extraLayout && !extraLayout.equals(winner.raw)) {
-      const alternative = compressOptimally(extraLayout);
-      if (alternative && alternative.length < winner.packed.length) {
-        winner = { raw: extraLayout, packed: alternative };
-      }
-    }
-    finish(winner.raw, winner.packed);
+    const packed = repack(winner, compressed, rowBytes);
+    const png = assemble(width, height, image.mode, packed, image.palette, image.transparency);
+    if (png.length < result.length) result = png;
   }
   return result;
 }

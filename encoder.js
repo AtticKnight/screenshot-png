@@ -188,12 +188,15 @@ function candidatesFor(image, w, h, effort, streams) {
   const order = streams.map((raw, index) => ({
     index, bytes: deflateSync(raw, { level: 3, memLevel: 9 }).length,
   })).sort((a, b) => a.bytes - b.bytes);
-  const indices = new Set(order.slice(0, effort).map(candidate => candidate.index));
+  // A quick preview already ranks these encodings. Avoid several expensive
+  // full-window searches on large direct-color images before choosing a layout.
+  const previews = streams[0].length > 1500000 ? Math.min(effort, 2) : effort;
+  const indices = new Set(order.slice(0, previews).map(candidate => candidate.index));
   if (image.mode === 2 || image.mode === 6) indices.add(4);
   const candidates = [];
   for (const index of indices) {
     const raw = streams[index];
-    const packed = deflateSync(raw, { level: 9, memLevel: 8 });
+    const packed = deflateSync(raw, { level: 7, memLevel: 8 });
     const png = assemble(w, h, image.mode, packed, image.palette, image.transparency);
     candidates.push({ png, raw, image, index });
   }

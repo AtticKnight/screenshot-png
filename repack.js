@@ -1357,38 +1357,7 @@ function splitDenseBlocks(raw, base) {
   return compressed.length < base.length ? compressed : base;
 }
 
-// Dense images can still have a few text or flat-color sections. Reparse a
-// bounded selection of whole DEFLATE blocks and retain the other original bits.
-function localDenseParse(raw, packed, stride) {
-  const plan = readPlan(packed, raw.length, true);
-  const candidates = [];
-  for (const block of plan.blocks) {
-    const length = block.end - block.start;
-    const bytes = (block.dataEnd - block.header) / 8;
-    const density = bytes / length;
-    if (block.type === 0 || length < 5000 || length > 300000 ||
-        density < 0.012 || density > 0.84) continue;
-    const merit = Math.sqrt(length) * (1 - density) * Math.min(1, density * 8);
-    candidates.push({ start: block.start, length, merit });
-  }
-  candidates.sort((a, b) => b.merit - a.merit || a.start - b.start);
-  let budget = 310000;
-  const selected = new Set();
-  for (const block of candidates) {
-    if (selected.size >= 6 || block.length > budget) continue;
-    budget -= block.length;
-    selected.add(block.start);
-  }
-  if (!selected.size) return packed;
-  const runs = new Uint16Array(raw.length);
-  for (let i = raw.length - 1; i >= 0; i--) {
-    runs[i] = raw[i] === raw[i + 1] ? Math.min(258, runs[i + 1] + 1) : 1;
-  }
-  const prior = priorOccurrences(raw, runs, stride);
-  const alternatives = [deflateSync(raw, { level: 3, memLevel: 8 })];
-  return reprice(raw, packed, alternatives, prior, runs, 36, 0, true, selected);
-}
-// The second token search can revisit millions of raw positions. Give large
+// A token search can revisit millions of raw positions. Give large
 // images a fixed work allowance shared by their blocks. A block with more
 // matches from different distances has more ways to improve its earlier parse.
 function selectRefinementBlocks(raw, packed) {
@@ -1411,7 +1380,7 @@ function selectRefinementBlocks(raw, packed) {
     options.push({ start: block.start, length, priority });
   }
   options.sort((a, b) => b.priority - a.priority || a.start - b.start);
-  let remaining = Math.min(2300000, Math.floor(raw.length * 0.68));
+  let remaining = Math.min(1200000, Math.floor(raw.length * 0.50));
   const selected = new Set();
   for (const option of options) {
     if (option.length > remaining) continue;
@@ -1422,32 +1391,29 @@ function selectRefinementBlocks(raw, packed) {
 }
 
 export function repack(raw, packed, stride = 0) {
+  // Dense data offers few useful alternative matches. Reuse its tokens and
+  // look for a cheaper block boundary or a smaller Huffman header.
   if (packed.length > 175000) {
-    const localized = localDenseParse(raw, packed, stride);
-    return packed.length > 245000 ? splitDenseBlocks(raw, tuneHeaders(raw, localized))
-      : tuneHeaders(raw, repartition(raw, localized, 460));
+    return packed.length > 245000 ? splitDenseBlocks(raw, tuneHeaders(raw, packed))
+      : tuneHeaders(raw, repartition(raw, packed, 460));
   }
   const alternatives = [
     deflateSync(raw, { level: 1, memLevel: 9 }),
     deflateSync(raw, { level: 5, memLevel: 8 }),
     deflateSync(raw, { level: 9, memLevel: 9 }),
   ];
-  const runs = new Uint16Array(raw.length);
-  for (let i = raw.length - 1; i >= 0; i--) {
-    runs[i] = raw[i] === raw[i + 1] ? Math.min(258, runs[i + 1] + 1) : 1;
+  const blocks = selectRefinementBlocks(raw, packed);
+  let parsed = packed;
+  if (!blocks || blocks.size) {
+    const runs = new Uint16Array(raw.length);
+    for (let i = raw.length - 1; i >= 0; i--) {
+      runs[i] = raw[i] === raw[i + 1] ? Math.min(258, runs[i + 1] + 1) : 1;
+    }
+    const prior = priorOccurrences(raw, runs, stride);
+    const large = raw.length > 1400000;
+    parsed = reprice(raw, packed, alternatives, prior, runs,
+      large ? 38 : 52, large ? 36000 : 68000, true, blocks);
   }
-  const prior = priorOccurrences(raw, runs, stride);
-  const large = raw.length > 1400000;
-  const first = reprice(raw, packed, alternatives, prior, runs, large ? 52 : 80, large ? 65000 : 125000);
-  const grouped = repartition(raw, first, packed.length < 180000 ? 240 : 380);
-  const blocks = selectRefinementBlocks(raw, grouped);
-  const best = !blocks || blocks.size
-    ? reprice(raw, grouped, [packed, alternatives[0], alternatives[1]], prior, runs, large ? 38 : 62, large ? 42000 : 85000, true, blocks)
-    : grouped;
-  const tuned = tuneHeaders(raw, best);
-  // The fractional parse changes token counts and the best places to switch
-  // Huffman tables. Reprice candidate boundaries on that final token sequence.
-  const finalGrain = tuned.length < 55000 ? 150 : 300;
-  const regrouped = repartition(raw, tuned, finalGrain);
-  return regrouped === tuned ? tuned : tuneHeaders(raw, regrouped);
+  const grain = parsed.length < 55000 ? 155 : 300;
+  return tuneHeaders(raw, repartition(raw, parsed, grain));
 }

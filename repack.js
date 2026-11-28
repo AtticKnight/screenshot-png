@@ -530,11 +530,7 @@ function reprice(raw, base, alternateStreams, prior, runs, depthLimit, extraStar
       if (end > 4) events[end - 4] = 1;
     }
   }
-  if (base.length < 85000 && raw.length <= 1400000 && extraStarts) {
-    for (let i = 1; i + 2 < raw.length; i++) {
-      if (raw[i - 1] !== raw[i] || runs[i] <= 3 || (i & 31) === 0) events[i] = 1;
-    }
-  } else if (base.length < 185000 && extraStarts) {
+  if (base.length < 185000 && extraStarts) {
     // Spread a fixed number of extra starts across the input. Existing matches
     // always remain eligible, even on unusually noisy screenshots.
     const interval = Math.max(1, Math.ceil(raw.length / extraStarts));

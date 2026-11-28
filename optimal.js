@@ -3,7 +3,7 @@ import { memory, input_pointer, output_pointer, prepare, compress_image } from '
 const heap = new Uint8Array(memory.buffer);
 const inputStart = input_pointer();
 const outputStart = output_pointer();
-const initialized = prepare(12) !== 0;
+const initialized = prepare(11) !== 0;
 
 // libdeflate's near-optimal parser evaluates length and distance costs together.
 // One compressor and two buffers are reused for the entire set of screenshots.

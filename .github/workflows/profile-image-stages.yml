@@ -1,0 +1,38 @@
+name: Profile legal PNG encodings on public and independent draws
+on:
+  push:
+    branches: [profile/screenshot-cpu-stages]
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        draw: [practice, hazel, ocean, basalt, mosaic]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - run: python3 check/fetch.py
+      - name: Generate a fresh public test set
+        env:
+          DRAW: ${{ matrix.draw }}
+        run: |
+          if test "$DRAW" = practice; then
+            cp -a check/kit/practice check/profile
+          else
+            mkdir -p check/profile-seed
+            node -e 'const fs=require("node:fs"),c=require("node:crypto");fs.writeFileSync("check/profile-seed/seed.json",JSON.stringify({schema:"agent-fun/instance-seed/v1",seed:c.createHash("sha256").update("AtticKnight PNG runtime stress draw "+process.env.DRAW).digest("hex")}))'
+            MAKEFUN_INPUT_DIR="$PWD/check/profile-seed" MAKEFUN_OUTPUT_DIR="$PWD/check/profile" node check/kit/program/generator/draw.ts
+          fi
+      - name: Profile normal entry point on one CPU
+        run: |
+          mkdir -p check/profile-out
+          export MAKEFUN_INPUT_DIR="$PWD/check/profile/input" MAKEFUN_OUTPUT_DIR="$PWD/check/profile-out"
+          /usr/bin/time -f 'ENTIRE SET seconds=%e peakKiB=%M' python3 -c 'import os; os.sched_setaffinity(0,{min(os.sched_getaffinity(0))});os.execvp("node",["node","main.ts"])'

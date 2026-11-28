@@ -1,3 +1,4 @@
+import { timed } from './check/timing.mjs';
 import { deflateSync } from 'node:zlib';
 
 // Binary package-merge computes optimal length-limited Huffman codes. At each
@@ -1348,6 +1349,11 @@ function splitDenseBlocks(raw, base) {
   return compressed.length < base.length ? compressed : base;
 }
 
+priorOccurrences = timed('index',priorOccurrences);
+reprice = timed('match-parse',reprice);
+repartition = timed('block-cuts',repartition);
+tuneHeaders = timed('header',tuneHeaders);
+splitDenseBlocks = timed('dense-splits',splitDenseBlocks);
 export function repack(raw, packed, stride = 0) {
   if (packed.length > 245000) return splitDenseBlocks(raw, tuneHeaders(raw, packed));
   if (packed.length > 175000) return tuneHeaders(raw, repartition(raw, packed, 460));

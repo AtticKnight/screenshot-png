@@ -1,5 +1,6 @@
+import { timed } from './check/timing.mjs';
 import { crc32, deflateRawSync, deflateSync, inflateSync } from 'node:zlib';
-import { compressOptimally } from './optimal.js';
+import { compressOptimally as underlyingCompression } from './optimal.js';
 import { repack } from './repack.js';
 
 
@@ -375,6 +376,15 @@ function polishBoundaryRows(base, streams, width, height, channels) {
   }
   return result;
 }
+
+const compressOptimally = timed('libdeflate', underlyingCompression);
+filteredImages = timed('filters', filteredImages);
+candidatesFor = timed('preview', candidatesFor);
+polishStrips = timed('polish-strips', polishStrips);
+chooseFilterPath = timed('filter-path', chooseFilterPath);
+polishBoundaryRows = timed('boundary-rows', polishBoundaryRows);
+const originalChooseStrips = chooseStrips;
+chooseStrips = (streams,w,h,c,n,history,level) => timed('strips-'+n+'-'+level,originalChooseStrips)(streams,w,h,c,n,history,level);
 
 export function encodeScreenshot(file) {
   const { width, height, pixels } = decodeRgba(file);
